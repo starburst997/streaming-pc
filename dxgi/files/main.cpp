@@ -12,7 +12,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <d3d11.h>
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -378,15 +378,55 @@ void InitDuplication() {
     adapter->Release();
     if (!output) Fatal("Source monitor not found");
 
-    IDXGIOutput1* out1; output->QueryInterface(&out1); output->Release();
-    hr = out1->DuplicateOutput(g.capDevice, &g.duplication);
-    out1->Release();
-    if (FAILED(hr)) Fatal("DuplicateOutput", hr);
+    // Try IDXGIOutput6 first (Windows 10 1803+), then IDXGIOutput5, then fall back to IDXGIOutput1
+    // DuplicateOutput1 allows us to request HDR format (R16G16B16A16_FLOAT)
+    IDXGIOutput6* out6 = nullptr;
+    IDXGIOutput5* out5 = nullptr;
+    IDXGIOutput1* out1 = nullptr;
+
+    // Formats we support, in order of preference
+    DXGI_FORMAT supportedFormats[] = {
+        DXGI_FORMAT_R16G16B16A16_FLOAT,  // HDR
+        DXGI_FORMAT_B8G8R8A8_UNORM,      // SDR
+    };
+
+    hr = output->QueryInterface(&out6);
+    if (SUCCEEDED(hr)) {
+        hr = out6->DuplicateOutput1(g.capDevice, 0, _countof(supportedFormats), supportedFormats, &g.duplication);
+        out6->Release();
+        if (SUCCEEDED(hr)) {
+            if (g.debug) printf("[DEBUG] Using IDXGIOutput6::DuplicateOutput1 (HDR supported)\n");
+        }
+    }
+
+    if (!g.duplication) {
+        hr = output->QueryInterface(&out5);
+        if (SUCCEEDED(hr)) {
+            hr = out5->DuplicateOutput1(g.capDevice, 0, _countof(supportedFormats), supportedFormats, &g.duplication);
+            out5->Release();
+            if (SUCCEEDED(hr)) {
+                if (g.debug) printf("[DEBUG] Using IDXGIOutput5::DuplicateOutput1 (HDR supported)\n");
+            }
+        }
+    }
+
+    if (!g.duplication) {
+        // Fall back to old method (no HDR support)
+        hr = output->QueryInterface(&out1);
+        if (SUCCEEDED(hr)) {
+            hr = out1->DuplicateOutput(g.capDevice, &g.duplication);
+            out1->Release();
+            if (SUCCEEDED(hr)) {
+                if (g.debug) printf("[DEBUG] Using IDXGIOutput1::DuplicateOutput (no HDR support)\n");
+            }
+        }
+    }
+
+    output->Release();
+    if (FAILED(hr) || !g.duplication) Fatal("DuplicateOutput", hr);
 
     DXGI_OUTDUPL_DESC dd; g.duplication->GetDesc(&dd);
 
-    // Note: dd.ModeDesc.Format may not match actual captured frame format!
-    // We'll detect the real format from the first captured frame.
     g.sourceReportedHDR = (dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
     printf("  Reported format: %s (DXGI_FORMAT=%d)\n",
@@ -488,21 +528,13 @@ void CaptureThreadFunc() {
                     g.sourceIsHDR = (td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
                     if (g.sourceIsHDR) {
-                        // Actual HDR format (R16G16B16A16_FLOAT)
                         if (g.tonemap) {
                             printf("  Processing: Reinhard tonemapping (HDR to SDR)\n");
                         } else {
-                            printf("  Processing: None (HDR output may be clipped)\n");
-                        }
-                    } else if (g.sourceReportedHDR) {
-                        // Monitor reports HDR but gives SDR format - needs gamma correction
-                        if (g.tonemap) {
-                            printf("  Processing: Gamma correction (HDR monitor, SDR capture)\n");
-                        } else {
-                            printf("  Processing: None (--no-tonemap)\n");
+                            printf("  Processing: None (--no-tonemap, HDR values may clip)\n");
                         }
                     } else {
-                        printf("  Processing: None (SDR source)\n");
+                        printf("  Processing: Passthrough (SDR)\n");
                     }
 
                     // Initialize triple buffer with actual format
@@ -600,13 +632,9 @@ void Render() {
 
     // Select pixel shader based on source format:
     // - sourceIsHDR (actual R16G16B16A16_FLOAT): use HDR tonemapping shader
-    // - sourceReportedHDR but actual SDR format: use SDR gamma shader (linear->sRGB)
-    // - true SDR source: use passthrough shader
+    // - SDR source: use passthrough shader
     if (g.sourceIsHDR && g.tonemap) {
         g.context->PSSetShader(g.psHDR, 0, 0);
-    } else if (g.sourceReportedHDR && !g.sourceIsHDR && g.tonemap) {
-        // Monitor reports HDR but gives SDR format - apply gamma correction
-        g.context->PSSetShader(g.psSDRGamma, 0, 0);
     } else {
         g.context->PSSetShader(g.psSDR, 0, 0);
     }
