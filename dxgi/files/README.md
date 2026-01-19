@@ -8,7 +8,7 @@ Low-latency display mirroring with perfect vsync output. Supports HDR to SDR ton
 
 **Main thread**: Renders with VSync (`Present(1, 0)`), outputs at target refresh rate
 
-Triple-buffered staging textures ensure lock-free operation with no flicker.
+Triple-buffered staging textures ensure lock-free operation with no flicker. Uses waitable swap chain for optimal frame pacing when source and target refresh rates differ (e.g., 120Hz → 60Hz).
 
 ## HDR Support
 
@@ -51,6 +51,7 @@ dxgi-mirror.exe [options]
   --stretch      Stretch to fill (ignore aspect ratio)
   --no-tonemap   Disable HDR to SDR tonemapping
   --sdr-white N  SDR white level in nits (default: 240)
+  --no-cursor    Hide the mouse cursor
   --list         List monitors
 ```
 

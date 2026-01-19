@@ -128,6 +128,16 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return float4(color.rgb, 1.0);
 })";
 
+// Cursor pixel shader - handles alpha blending and masked cursors
+const char* g_PixelShaderCursor = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float4 color = tex.Sample(samp, uv);
+    return color;  // Alpha blending handled by blend state
+})";
+
 struct Vertex { float x, y, u, v; };
 Vertex g_Quad[] = {{-1,1,0,0}, {1,1,1,0}, {-1,-1,0,1}, {1,-1,1,1}};
 
@@ -169,12 +179,32 @@ struct TripleBuffer {
     int GetWriteIndex() { return writeIdx.load(std::memory_order_relaxed); }
 };
 
+// Cursor info shared between capture and render threads
+struct CursorInfo {
+    std::atomic<bool> visible{true};   // Default to visible (will be updated on first cursor event)
+    std::atomic<bool> hasShape{false};  // True once we've captured a cursor shape
+    std::atomic<int> x{0};
+    std::atomic<int> y{0};
+    std::atomic<int> width{0};
+    std::atomic<int> height{0};
+    std::atomic<bool> shapeUpdated{false};
+
+    // Shape data (protected by shapeUpdated flag)
+    BYTE* shapeBuffer = nullptr;
+    UINT shapeBufferSize = 0;
+    UINT shapeWidth = 0;
+    UINT shapeHeight = 0;
+    UINT shapePitch = 0;
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE shapeType = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
+};
+
 struct {
     int sourceMonitor = 0;
     int targetMonitor = 1;
     bool preserveAspect = true;
     bool tonemap = true;  // HDR to SDR tonemapping (can be disabled with --no-tonemap)
     float sdrWhiteNits = 240.0f;  // SDR white level in nits (matches OBS default)
+    bool showCursor = true;  // Show cursor (can be disabled with --no-cursor)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -196,6 +226,14 @@ struct {
     ID3D11Buffer* cbHDR = nullptr;  // Constant buffer for HDR shader
     ID3D11SamplerState* sampler = nullptr;
 
+    // Cursor resources
+    ID3D11PixelShader* psCursor = nullptr;
+    ID3D11Texture2D* cursorTex = nullptr;
+    ID3D11ShaderResourceView* cursorSrv = nullptr;
+    ID3D11Buffer* cursorVb = nullptr;
+    ID3D11BlendState* blendState = nullptr;
+    CursorInfo cursor;
+
     // Capture thread resources
     ID3D11Device* capDevice = nullptr;
     ID3D11DeviceContext* capContext = nullptr;
@@ -216,6 +254,9 @@ struct {
     std::atomic<int> captureCount{0};
     std::atomic<UINT64> captureFrameId{0};
     UINT64 lastRenderedId = 0;
+
+    // Frame pacing
+    HANDLE frameLatencyWaitable = nullptr;
 
     std::thread captureThread;
 } g;
@@ -330,10 +371,20 @@ void InitD3D() {
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     hr = factory->CreateSwapChainForHwnd(g.device, g.hwnd, &scd, nullptr, nullptr, &g.swapChain);
     factory->Release();
     if (FAILED(hr)) Fatal("CreateSwapChain", hr);
+
+    // Set max frame latency to 1 for tighter timing control
+    IDXGISwapChain2* swapChain2 = nullptr;
+    hr = g.swapChain->QueryInterface(&swapChain2);
+    if (SUCCEEDED(hr)) {
+        swapChain2->SetMaximumFrameLatency(1);
+        g.frameLatencyWaitable = swapChain2->GetFrameLatencyWaitableObject();
+        swapChain2->Release();
+    }
 
     ID3D11Texture2D* bb;
     g.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -396,6 +447,32 @@ void InitShaders() {
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g.device->CreateBuffer(&cbd, nullptr, &g.cbHDR);
+
+    // Cursor pixel shader
+    hr = D3DCompile(g_PixelShaderCursor, strlen(g_PixelShaderCursor), "PS_Cursor", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
+    if (FAILED(hr)) Fatal("PS Cursor compile");
+    g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psCursor);
+    blob->Release();
+
+    // Blend state for cursor alpha blending
+    D3D11_BLEND_DESC blendDesc = {};
+    blendDesc.RenderTarget[0].BlendEnable = TRUE;
+    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    g.device->CreateBlendState(&blendDesc, &g.blendState);
+
+    // Dynamic vertex buffer for cursor (updated each frame)
+    D3D11_BUFFER_DESC cvbd = {};
+    cvbd.Usage = D3D11_USAGE_DYNAMIC;
+    cvbd.ByteWidth = sizeof(Vertex) * 4;
+    cvbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    cvbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g.device->CreateBuffer(&cvbd, nullptr, &g.cursorVb);
 }
 
 void InitDuplication() {
@@ -538,6 +615,46 @@ void CaptureThreadFunc() {
         if (FAILED(hr)) {
             if (g.debug) printf("[DEBUG] AcquireNextFrame failed: 0x%08X\n", (unsigned)hr);
             continue;
+        }
+
+        // Capture cursor info (always, not just on new content)
+        if (g.showCursor) {
+            // Update cursor position only if we got a mouse update
+            // (LastMouseUpdateTime is non-zero when there's a cursor update)
+            if (info.LastMouseUpdateTime.QuadPart != 0) {
+                g.cursor.visible.store(info.PointerPosition.Visible != 0, std::memory_order_relaxed);
+                g.cursor.x.store(info.PointerPosition.Position.x, std::memory_order_relaxed);
+                g.cursor.y.store(info.PointerPosition.Position.y, std::memory_order_relaxed);
+            }
+
+            // Get cursor shape if it changed
+            if (info.PointerShapeBufferSize > 0) {
+                if (g.cursor.shapeBufferSize < info.PointerShapeBufferSize) {
+                    delete[] g.cursor.shapeBuffer;
+                    g.cursor.shapeBuffer = new BYTE[info.PointerShapeBufferSize];
+                    g.cursor.shapeBufferSize = info.PointerShapeBufferSize;
+                }
+
+                UINT bufferSizeRequired;
+                DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo;
+                hr = g.duplication->GetFramePointerShape(
+                    g.cursor.shapeBufferSize, g.cursor.shapeBuffer,
+                    &bufferSizeRequired, &shapeInfo);
+
+                if (SUCCEEDED(hr)) {
+                    g.cursor.shapeWidth = shapeInfo.Width;
+                    g.cursor.shapeHeight = shapeInfo.Height;
+                    g.cursor.shapePitch = shapeInfo.Pitch;
+                    g.cursor.shapeType = (DXGI_OUTDUPL_POINTER_SHAPE_TYPE)shapeInfo.Type;
+                    g.cursor.width.store(shapeInfo.Width, std::memory_order_relaxed);
+                    g.cursor.height.store(
+                        shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ?
+                        shapeInfo.Height / 2 : shapeInfo.Height,
+                        std::memory_order_relaxed);
+                    g.cursor.hasShape.store(true, std::memory_order_relaxed);
+                    g.cursor.shapeUpdated.store(true, std::memory_order_release);
+                }
+            }
         }
 
         // Check for new frame content
@@ -697,6 +814,161 @@ void Render() {
 
     g.context->Draw(4, 0);
 
+    // Render cursor if visible and we have a shape
+    if (g.showCursor && g.cursor.hasShape.load(std::memory_order_relaxed) &&
+        g.cursor.visible.load(std::memory_order_relaxed)) {
+        // Update cursor texture if shape changed
+        if (g.cursor.shapeUpdated.exchange(false, std::memory_order_acquire)) {
+            // Release old texture
+            if (g.cursorSrv) { g.cursorSrv->Release(); g.cursorSrv = nullptr; }
+            if (g.cursorTex) { g.cursorTex->Release(); g.cursorTex = nullptr; }
+
+            UINT width = g.cursor.shapeWidth;
+            UINT height = g.cursor.shapeHeight;
+            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+                height /= 2;  // Monochrome cursors are AND mask + XOR mask
+            }
+
+            // Create cursor texture
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = width;
+            td.Height = height;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            // Convert cursor data to BGRA with proper alpha
+            UINT* pixels = new UINT[width * height];
+
+            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+                // Monochrome: AND mask then XOR mask, each 1 bit per pixel
+                UINT pitch = g.cursor.shapePitch;
+                for (UINT y = 0; y < height; y++) {
+                    for (UINT x = 0; x < width; x++) {
+                        UINT byteIdx = x / 8;
+                        UINT bitIdx = 7 - (x % 8);
+                        BYTE andMask = (g.cursor.shapeBuffer[y * pitch + byteIdx] >> bitIdx) & 1;
+                        BYTE xorMask = (g.cursor.shapeBuffer[(y + height) * pitch + byteIdx] >> bitIdx) & 1;
+
+                        if (andMask == 0 && xorMask == 0) {
+                            pixels[y * width + x] = 0xFF000000;  // Black, opaque
+                        } else if (andMask == 0 && xorMask == 1) {
+                            pixels[y * width + x] = 0xFFFFFFFF;  // White, opaque
+                        } else if (andMask == 1 && xorMask == 0) {
+                            pixels[y * width + x] = 0x00000000;  // Transparent
+                        } else {
+                            // XOR (invert) - render as semi-transparent white
+                            pixels[y * width + x] = 0x80FFFFFF;
+                        }
+                    }
+                }
+            } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+                // Color cursor: BGRA format with premultiplied alpha
+                // Alpha channel is already correct (0 = transparent)
+                for (UINT y = 0; y < height; y++) {
+                    memcpy(&pixels[y * width], &g.cursor.shapeBuffer[y * g.cursor.shapePitch], width * 4);
+                }
+            } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+                // Masked color cursor format:
+                // - Alpha = 0x00: XOR pixel (invert) - we approximate with semi-transparent
+                // - Alpha = 0xFF: Replace pixel with RGB color (solid cursor pixel)
+                for (UINT y = 0; y < height; y++) {
+                    for (UINT x = 0; x < width; x++) {
+                        BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
+                        BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
+
+                        if (a == 0xFF) {
+                            // Solid pixel - use the color with full opacity
+                            pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
+                        } else if (a == 0 && (r | gc | b) != 0) {
+                            // XOR pixel with color - approximate as semi-transparent
+                            pixels[y * width + x] = 0x80000000 | (r << 16) | (gc << 8) | b;
+                        } else {
+                            // Transparent
+                            pixels[y * width + x] = 0x00000000;
+                        }
+                    }
+                }
+            }
+
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem = pixels;
+            initData.SysMemPitch = width * 4;
+
+            g.device->CreateTexture2D(&td, &initData, &g.cursorTex);
+            delete[] pixels;
+
+            if (g.cursorTex) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+                srvd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvd.Texture2D.MipLevels = 1;
+                g.device->CreateShaderResourceView(g.cursorTex, &srvd, &g.cursorSrv);
+            }
+        }
+
+        // Draw cursor if we have a texture
+        if (g.cursorSrv) {
+            int cursorX = g.cursor.x.load(std::memory_order_relaxed);
+            int cursorY = g.cursor.y.load(std::memory_order_relaxed);
+            int cursorW = g.cursor.width.load(std::memory_order_relaxed);
+            int cursorH = g.cursor.height.load(std::memory_order_relaxed);
+
+            // Calculate source dimensions
+            float srcW = (float)(g.sourceRect.right - g.sourceRect.left);
+            float srcH = (float)(g.sourceRect.bottom - g.sourceRect.top);
+
+            // Convert cursor position to viewport coordinates
+            float vpX = g.viewport.TopLeftX;
+            float vpY = g.viewport.TopLeftY;
+            float vpW = g.viewport.Width;
+            float vpH = g.viewport.Height;
+
+            // Scale cursor position and size
+            float scaleX = vpW / srcW;
+            float scaleY = vpH / srcH;
+
+            float cx = vpX + cursorX * scaleX;
+            float cy = vpY + cursorY * scaleY;
+            float cw = cursorW * scaleX;
+            float ch = cursorH * scaleY;
+
+            // Convert to NDC (-1 to 1)
+            float ndcX1 = (cx / g.windowWidth) * 2.0f - 1.0f;
+            float ndcY1 = 1.0f - (cy / g.windowHeight) * 2.0f;
+            float ndcX2 = ((cx + cw) / g.windowWidth) * 2.0f - 1.0f;
+            float ndcY2 = 1.0f - ((cy + ch) / g.windowHeight) * 2.0f;
+
+            // Update cursor vertex buffer
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(g.context->Map(g.cursorVb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                Vertex* verts = (Vertex*)mapped.pData;
+                verts[0] = {ndcX1, ndcY1, 0, 0};  // Top-left
+                verts[1] = {ndcX2, ndcY1, 1, 0};  // Top-right
+                verts[2] = {ndcX1, ndcY2, 0, 1};  // Bottom-left
+                verts[3] = {ndcX2, ndcY2, 1, 1};  // Bottom-right
+                g.context->Unmap(g.cursorVb, 0);
+            }
+
+            // Enable alpha blending
+            float blendFactor[4] = {0, 0, 0, 0};
+            g.context->OMSetBlendState(g.blendState, blendFactor, 0xFFFFFFFF);
+
+            // Draw cursor
+            g.context->PSSetShader(g.psCursor, 0, 0);
+            g.context->PSSetShaderResources(0, 1, &g.cursorSrv);
+            UINT stride = sizeof(Vertex), offset = 0;
+            g.context->IASetVertexBuffers(0, 1, &g.cursorVb, &stride, &offset);
+            g.context->Draw(4, 0);
+
+            // Disable blending
+            g.context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFF);
+        }
+    }
+
     ID3D11ShaderResourceView* null = nullptr;
     g.context->PSSetShaderResources(0, 1, &null);
 }
@@ -722,6 +994,14 @@ void Cleanup() {
     if (g.capContext) { g.capContext->Release(); g.capContext = nullptr; }
     if (g.capDevice) { g.capDevice->Release(); g.capDevice = nullptr; }
 
+    // Release cursor resources
+    if (g.cursorSrv) { g.cursorSrv->Release(); g.cursorSrv = nullptr; }
+    if (g.cursorTex) { g.cursorTex->Release(); g.cursorTex = nullptr; }
+    if (g.cursorVb) { g.cursorVb->Release(); g.cursorVb = nullptr; }
+    if (g.blendState) { g.blendState->Release(); g.blendState = nullptr; }
+    if (g.psCursor) { g.psCursor->Release(); g.psCursor = nullptr; }
+    delete[] g.cursor.shapeBuffer; g.cursor.shapeBuffer = nullptr;
+
     // Release render resources
     if (g.sampler) { g.sampler->Release(); g.sampler = nullptr; }
     if (g.cbHDR) { g.cbHDR->Release(); g.cbHDR = nullptr; }
@@ -732,6 +1012,7 @@ void Cleanup() {
     if (g.psSDR) { g.psSDR->Release(); g.psSDR = nullptr; }
     if (g.vs) { g.vs->Release(); g.vs = nullptr; }
     if (g.rtv) { g.rtv->Release(); g.rtv = nullptr; }
+    if (g.frameLatencyWaitable) { CloseHandle(g.frameLatencyWaitable); g.frameLatencyWaitable = nullptr; }
     if (g.swapChain) { g.swapChain->Release(); g.swapChain = nullptr; }
     if (g.context) { g.context->Release(); g.context = nullptr; }
     if (g.device) { g.device->Release(); g.device = nullptr; }
@@ -746,7 +1027,7 @@ void PrintUsage(const char* prog) {
     printf("  --stretch      Stretch to fill (ignore aspect ratio)\n");
     printf("  --no-tonemap   Disable HDR to SDR tonemapping\n");
     printf("  --sdr-white N  SDR white level in nits for HDR tonemapping (default: 240)\n");
-    printf("                 Check Windows Settings > Display > HDR > SDR content brightness\n");
+    printf("  --no-cursor    Hide the mouse cursor\n");
     printf("  --debug        Enable debug output\n");
     printf("  --list         List monitors\n");
 }
@@ -763,6 +1044,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stretch")) g.preserveAspect = false;
         else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
         else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--no-cursor")) g.showCursor = false;
         else if (!strcmp(argv[i], "--debug")) g.debug = true;
         else if (!strcmp(argv[i], "--list")) { PrintMonitors(); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { PrintUsage(argv[0]); return 0; }
@@ -828,6 +1110,15 @@ int main(int argc, char** argv) {
 
     MSG msg;
     while (g.running) {
+        // Wait for VSync timing signal (if waitable swap chain is available)
+        // This ensures we acquire the freshest frame right after VSync
+        if (g.frameLatencyWaitable) {
+            WaitForSingleObjectEx(g.frameLatencyWaitable, 100, TRUE);
+            // Small delay to let capture thread finish any in-flight frame
+            // This helps ensure consistent frame selection for 120Hz->60Hz
+            Sleep(1);
+        }
+
         while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { g.running = false; break; }
             TranslateMessage(&msg); DispatchMessage(&msg);
