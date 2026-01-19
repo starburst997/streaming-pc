@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <climits>
 #include <thread>
 #include <atomic>
 
@@ -141,17 +142,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 struct Vertex { float x, y, u, v; };
 Vertex g_Quad[] = {{-1,1,0,0}, {1,1,1,0}, {-1,-1,0,1}, {1,-1,1,1}};
 
-// Triple buffer for lock-free producer/consumer
+// Triple buffer for lock-free producer/consumer with frame ID tracking
 struct TripleBuffer {
     ID3D11Texture2D* textures[3] = {nullptr, nullptr, nullptr};
     ID3D11ShaderResourceView* srvs[3] = {nullptr, nullptr, nullptr};
+
+    // Frame IDs for each buffer slot (for consistent frame selection)
+    std::atomic<UINT64> frameIds[3] = {{0}, {0}, {0}};
 
     std::atomic<int> writeIdx{0};
     std::atomic<int> readyIdx{-1};
     std::atomic<int> displayIdx{-1};
 
-    void PublishFrame() {
+    // Last displayed frame ID (for consistent frame skipping)
+    UINT64 lastDisplayedFrameId = 0;
+
+    void PublishFrame(UINT64 frameId) {
         int completed = writeIdx.load(std::memory_order_relaxed);
+        frameIds[completed].store(frameId, std::memory_order_relaxed);
         int oldReady = readyIdx.exchange(completed, std::memory_order_acq_rel);
 
         if (oldReady >= 0 && oldReady != displayIdx.load(std::memory_order_acquire)) {
@@ -168,15 +176,27 @@ struct TripleBuffer {
         }
     }
 
-    int AcquireFrame() {
+    int AcquireFrame(UINT64* outFrameId = nullptr) {
         int ready = readyIdx.exchange(-1, std::memory_order_acq_rel);
         if (ready >= 0) {
             displayIdx.store(ready, std::memory_order_release);
         }
-        return displayIdx.load(std::memory_order_acquire);
+        int idx = displayIdx.load(std::memory_order_acquire);
+        if (idx >= 0 && outFrameId) {
+            *outFrameId = frameIds[idx].load(std::memory_order_relaxed);
+        }
+        return idx;
     }
 
     int GetWriteIndex() { return writeIdx.load(std::memory_order_relaxed); }
+
+    UINT64 GetReadyFrameId() {
+        int ready = readyIdx.load(std::memory_order_acquire);
+        if (ready >= 0) {
+            return frameIds[ready].load(std::memory_order_relaxed);
+        }
+        return 0;
+    }
 };
 
 // Cursor info shared between capture and render threads
@@ -205,6 +225,9 @@ struct {
     bool tonemap = true;  // HDR to SDR tonemapping (can be disabled with --no-tonemap)
     float sdrWhiteNits = 240.0f;  // SDR white level in nits (matches OBS default)
     bool showCursor = true;  // Show cursor (can be disabled with --no-cursor)
+    bool useWaitableSwapChain = true;  // Use waitable swap chain for frame pacing
+    bool useFrameDelay = true;  // Add small delay after waitable for consistent frame selection
+    int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -250,18 +273,49 @@ struct {
     DXGI_FORMAT sourceFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     std::atomic<bool> bufferInitialized{false};
 
+    // Refresh rates (detected during initialization)
+    float sourceRefreshRate = 60.0f;
+    float targetRefreshRate = 60.0f;
+
     // Stats
     std::atomic<int> captureCount{0};
     std::atomic<UINT64> captureFrameId{0};
     UINT64 lastRenderedId = 0;
+    UINT64 lastCaptureCheckId = 0;  // For detecting idle desktop
+
+    // Frame pacing stats
+    int frameSkipMin = INT_MAX;
+    int frameSkipMax = 0;
+    int frameSkipTotal = 0;
+    int frameSkipCount = 0;
 
     // Frame pacing
     HANDLE frameLatencyWaitable = nullptr;
+    int targetFrameSkip = 0;  // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
+    bool useSmartFrameSelection = true;  // Wait for correct frame ID instead of fixed delay
 
     std::thread captureThread;
 } g;
 
 void Cleanup();
+
+// High-precision microsecond delay using spin-wait
+// Sleep() only has ~1ms precision, this gives µs precision
+void DelayMicroseconds(int us) {
+    if (us <= 0) return;
+
+    LARGE_INTEGER freq, start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+
+    double targetTicks = (double)us * freq.QuadPart / 1000000.0;
+    LONGLONG endTicks = start.QuadPart + (LONGLONG)targetTicks;
+
+    // Spin-wait for precise timing
+    do {
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < endTicks);
+}
 
 void Fatal(const char* msg, HRESULT hr = 0) {
     if (hr) fprintf(stderr, "FATAL: %s (0x%08X)\n", msg, (unsigned)hr);
@@ -371,19 +425,23 @@ void InitD3D() {
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    if (g.useWaitableSwapChain) {
+        scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
 
     hr = factory->CreateSwapChainForHwnd(g.device, g.hwnd, &scd, nullptr, nullptr, &g.swapChain);
     factory->Release();
     if (FAILED(hr)) Fatal("CreateSwapChain", hr);
 
     // Set max frame latency to 1 for tighter timing control
-    IDXGISwapChain2* swapChain2 = nullptr;
-    hr = g.swapChain->QueryInterface(&swapChain2);
-    if (SUCCEEDED(hr)) {
-        swapChain2->SetMaximumFrameLatency(1);
-        g.frameLatencyWaitable = swapChain2->GetFrameLatencyWaitableObject();
-        swapChain2->Release();
+    if (g.useWaitableSwapChain) {
+        IDXGISwapChain2* swapChain2 = nullptr;
+        hr = g.swapChain->QueryInterface(&swapChain2);
+        if (SUCCEEDED(hr)) {
+            swapChain2->SetMaximumFrameLatency(1);
+            g.frameLatencyWaitable = swapChain2->GetFrameLatencyWaitableObject();
+            swapChain2->Release();
+        }
     }
 
     ID3D11Texture2D* bb;
@@ -454,7 +512,8 @@ void InitShaders() {
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psCursor);
     blob->Release();
 
-    // Blend state for cursor alpha blending
+    // Blend state for cursor alpha blending (straight alpha)
+    // Using straight alpha blend as it's more compatible with various cursor formats
     D3D11_BLEND_DESC blendDesc = {};
     blendDesc.RenderTarget[0].BlendEnable = TRUE;
     blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
@@ -542,12 +601,12 @@ void InitDuplication() {
     DXGI_OUTDUPL_DESC dd; g.duplication->GetDesc(&dd);
 
     g.sourceReportedHDR = (dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    g.sourceRefreshRate = (float)dd.ModeDesc.RefreshRate.Numerator / dd.ModeDesc.RefreshRate.Denominator;
 
     printf("  Reported format: %s (DXGI_FORMAT=%d)\n",
            g.sourceReportedHDR ? "HDR" : "SDR", (int)dd.ModeDesc.Format);
     printf("  Resolution: %ux%u @ %.2fHz\n",
-           dd.ModeDesc.Width, dd.ModeDesc.Height,
-           (float)dd.ModeDesc.RefreshRate.Numerator / dd.ModeDesc.RefreshRate.Denominator);
+           dd.ModeDesc.Width, dd.ModeDesc.Height, g.sourceRefreshRate);
 }
 
 void InitTripleBuffer(DXGI_FORMAT format, UINT width, UINT height) {
@@ -653,6 +712,17 @@ void CaptureThreadFunc() {
                         std::memory_order_relaxed);
                     g.cursor.hasShape.store(true, std::memory_order_relaxed);
                     g.cursor.shapeUpdated.store(true, std::memory_order_release);
+
+                    if (g.debug) {
+                        const char* typeStr = "UNKNOWN";
+                        switch (shapeInfo.Type) {
+                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME: typeStr = "MONOCHROME"; break;
+                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR: typeStr = "COLOR"; break;
+                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR: typeStr = "MASKED_COLOR"; break;
+                        }
+                        printf("[DEBUG] Cursor shape: %s %ux%u pitch=%u\n",
+                               typeStr, shapeInfo.Width, shapeInfo.Height, shapeInfo.Pitch);
+                    }
                 }
             }
         }
@@ -718,8 +788,8 @@ void CaptureThreadFunc() {
                 g.capContext->CopyResource(sharedTex[writeIdx], tex);
                 g.capContext->Flush();
 
-                g.captureFrameId.fetch_add(1, std::memory_order_relaxed);
-                g.buffer.PublishFrame();
+                UINT64 frameId = g.captureFrameId.fetch_add(1, std::memory_order_relaxed) + 1;
+                g.buffer.PublishFrame(frameId);
                 g.captureCount.fetch_add(1, std::memory_order_relaxed);
 
                 // Signal buffer ready AFTER first frame is copied and published
@@ -866,10 +936,19 @@ void Render() {
                     }
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
-                // Color cursor: BGRA format with premultiplied alpha
-                // Alpha channel is already correct (0 = transparent)
+                // Color cursor: BGRA format with proper alpha channel
+                // These cursors use standard alpha blending:
+                // - Alpha = 0: fully transparent
+                // - Alpha = 255: fully opaque
+                // - Alpha values in between: semi-transparent
+                // Note: Don't treat black as transparent - that breaks I-beam cursors!
                 for (UINT y = 0; y < height; y++) {
-                    memcpy(&pixels[y * width], &g.cursor.shapeBuffer[y * g.cursor.shapePitch], width * 4);
+                    for (UINT x = 0; x < width; x++) {
+                        BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
+                        BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
+                        // Use alpha channel directly - this is the standard format
+                        pixels[y * width + x] = (a << 24) | (r << 16) | (gc << 8) | b;
+                    }
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
                 // Masked color cursor format:
@@ -1022,14 +1101,18 @@ void Cleanup() {
 void PrintUsage(const char* prog) {
     printf("DXGI Desktop Mirror\n\n");
     printf("Usage: %s [options]\n\n", prog);
-    printf("  --source N     Source monitor (default: 0)\n");
-    printf("  --target N     Target monitor (default: 1)\n");
-    printf("  --stretch      Stretch to fill (ignore aspect ratio)\n");
-    printf("  --no-tonemap   Disable HDR to SDR tonemapping\n");
-    printf("  --sdr-white N  SDR white level in nits for HDR tonemapping (default: 240)\n");
-    printf("  --no-cursor    Hide the mouse cursor\n");
-    printf("  --debug        Enable debug output\n");
-    printf("  --list         List monitors\n");
+    printf("  --source N       Source monitor (default: 0)\n");
+    printf("  --target N       Target monitor (default: 1)\n");
+    printf("  --stretch        Stretch to fill (ignore aspect ratio)\n");
+    printf("  --no-tonemap     Disable HDR to SDR tonemapping\n");
+    printf("  --sdr-white N    SDR white level in nits for HDR tonemapping (default: 240)\n");
+    printf("  --no-cursor      Hide the mouse cursor\n");
+    printf("  --no-waitable    Disable waitable swap chain (frame pacing)\n");
+    printf("  --no-smart-select Disable smart frame selection (use fixed delay)\n");
+    printf("  --no-frame-delay Disable frame delay (frame pacing fallback)\n");
+    printf("  --frame-delay N  Frame delay in microseconds (default: 1000 = 1ms)\n");
+    printf("  --debug          Enable debug output\n");
+    printf("  --list           List monitors\n");
 }
 
 int main(int argc, char** argv) {
@@ -1045,6 +1128,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
         else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-cursor")) g.showCursor = false;
+        else if (!strcmp(argv[i], "--no-waitable")) g.useWaitableSwapChain = false;
+        else if (!strcmp(argv[i], "--no-smart-select")) g.useSmartFrameSelection = false;
+        else if (!strcmp(argv[i], "--no-frame-delay")) g.useFrameDelay = false;
+        else if (!strcmp(argv[i], "--frame-delay") && i+1 < argc) g.frameDelayUs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--debug")) g.debug = true;
         else if (!strcmp(argv[i], "--list")) { PrintMonitors(); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { PrintUsage(argv[0]); return 0; }
@@ -1070,6 +1157,44 @@ int main(int argc, char** argv) {
     InitD3D();
     InitDuplication();
     InitShaders();
+
+    // Detect target refresh rate from the swap chain
+    {
+        IDXGIOutput* output = nullptr;
+        if (SUCCEEDED(g.swapChain->GetContainingOutput(&output))) {
+            DXGI_OUTPUT_DESC outputDesc;
+            output->GetDesc(&outputDesc);
+
+            DXGI_MODE_DESC modeDesc = {};
+            modeDesc.Width = g.windowWidth;
+            modeDesc.Height = g.windowHeight;
+            modeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+            DXGI_MODE_DESC closestMatch;
+            if (SUCCEEDED(output->FindClosestMatchingMode(&modeDesc, &closestMatch, g.device))) {
+                g.targetRefreshRate = (float)closestMatch.RefreshRate.Numerator / closestMatch.RefreshRate.Denominator;
+            }
+            output->Release();
+        }
+
+        // Calculate target frame skip for smart frame selection
+        // e.g., 120Hz source / 60Hz target = 2 (show every 2nd frame)
+        if (g.sourceRefreshRate > 0 && g.targetRefreshRate > 0) {
+            g.targetFrameSkip = (int)round(g.sourceRefreshRate / g.targetRefreshRate);
+            if (g.targetFrameSkip < 1) g.targetFrameSkip = 1;
+        }
+
+        printf("  Target: %.2fHz (frame skip: %d)\n", g.targetRefreshRate, g.targetFrameSkip);
+
+        // Print frame pacing strategy
+        if (g.targetFrameSkip > 1 && g.useSmartFrameSelection) {
+            printf("  Frame pacing: Smart selection (wait for frame N+%d)\n", g.targetFrameSkip);
+        } else if (g.useFrameDelay && g.frameDelayUs > 0) {
+            printf("  Frame pacing: Fixed delay (%d µs)\n", g.frameDelayUs);
+        } else {
+            printf("  Frame pacing: None (immediate)\n");
+        }
+    }
 
     // Triple buffer is initialized by capture thread on first frame
     // (to detect actual format, which may differ from reported format)
@@ -1114,9 +1239,32 @@ int main(int argc, char** argv) {
         // This ensures we acquire the freshest frame right after VSync
         if (g.frameLatencyWaitable) {
             WaitForSingleObjectEx(g.frameLatencyWaitable, 100, TRUE);
-            // Small delay to let capture thread finish any in-flight frame
-            // This helps ensure consistent frame selection for 120Hz->60Hz
-            Sleep(1);
+        }
+
+        // Smart frame selection: only wait for next frame if desktop is active
+        // This ensures consistent Skip:2-2 for 120Hz→60Hz while maintaining
+        // 60 FPS output when desktop is idle (showing duplicate frames)
+        if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
+            UINT64 currentCapture = g.captureFrameId.load(std::memory_order_relaxed);
+
+            // Check if new frames are coming in (desktop is active)
+            if (currentCapture > g.lastCaptureCheckId) {
+                // Desktop is active - wait for the right frame
+                UINT64 targetId = g.lastRenderedId + g.targetFrameSkip;
+
+                // Only wait if we haven't reached target yet
+                if (currentCapture < targetId) {
+                    // Use frame delay to wait for the next frame
+                    if (g.useFrameDelay && g.frameDelayUs > 0) {
+                        DelayMicroseconds(g.frameDelayUs);
+                    }
+                }
+            }
+            // Update check ID for next iteration
+            g.lastCaptureCheckId = currentCapture;
+        } else if (g.useFrameDelay && g.frameDelayUs > 0) {
+            // Fallback: simple fixed delay
+            DelayMicroseconds(g.frameDelayUs);
         }
 
         while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
@@ -1132,6 +1280,14 @@ int main(int argc, char** argv) {
 
         UINT64 currentFrameId = g.captureFrameId.load(std::memory_order_relaxed);
         if (currentFrameId != g.lastRenderedId) {
+            // Track frame skip delta for pacing analysis
+            if (g.lastRenderedId > 0) {
+                int skipDelta = (int)(currentFrameId - g.lastRenderedId);
+                if (skipDelta < g.frameSkipMin) g.frameSkipMin = skipDelta;
+                if (skipDelta > g.frameSkipMax) g.frameSkipMax = skipDelta;
+                g.frameSkipTotal += skipDelta;
+                g.frameSkipCount++;
+            }
             uniqCount++;
             g.lastRenderedId = currentFrameId;
         } else {
@@ -1143,10 +1299,21 @@ int main(int argc, char** argv) {
         if (statElapsed >= 1.0) {
             int capCount = g.captureCount.exchange(0, std::memory_order_relaxed);
             int dropCount = capCount > outCount ? capCount - outCount : 0;
-            printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d   ",
-                   outCount, capCount, uniqCount, dupCount, dropCount);
+
+            // Calculate average frame skip
+            float avgSkip = g.frameSkipCount > 0 ? (float)g.frameSkipTotal / g.frameSkipCount : 0;
+
+            printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d Skip:%d-%d(%.1f)   ",
+                   outCount, capCount, uniqCount, dupCount, dropCount,
+                   g.frameSkipMin == INT_MAX ? 0 : g.frameSkipMin, g.frameSkipMax, avgSkip);
             fflush(stdout);
+
+            // Reset stats
             outCount = uniqCount = dupCount = 0;
+            g.frameSkipMin = INT_MAX;
+            g.frameSkipMax = 0;
+            g.frameSkipTotal = 0;
+            g.frameSkipCount = 0;
             lastStat = now;
         }
     }
