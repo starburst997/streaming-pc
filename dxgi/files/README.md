@@ -12,11 +12,16 @@ Triple-buffered staging textures ensure lock-free operation with no flicker.
 
 ## HDR Support
 
-When the source monitor is HDR (DXGI_FORMAT_R16G16B16A16_FLOAT / scRGB), the program automatically applies **Reinhard tonemapping** to convert to SDR for display on SDR monitors.
+When the source monitor is HDR (DXGI_FORMAT_R16G16B16A16_FLOAT / scRGB), the program automatically applies **maxRGB Reinhard tonemapping** to convert to SDR for display on SDR monitors.
 
+- Uses `IDXGIOutput5/6::DuplicateOutput1` to capture actual HDR frames
+- maxRGB Reinhard preserves SDR content (values ≤1.0) and only compresses HDR highlights
 - Tonemapping is enabled by default
-- Use `--no-tonemap` to disable (output will be clipped)
-- Based on [OBS Studio's color.effect implementation](https://github.com/obsproject/obs-studio/blob/master/libobs/data/color.effect)
+- Use `--no-tonemap` to disable (output will be clipped/washed out)
+- Use `--sdr-white N` to adjust the SDR white level (default: 240 nits)
+
+References:
+- [OBS Studio color.effect](https://github.com/obsproject/obs-studio/blob/master/libobs/data/color.effect)
 
 ## Expected Stats
 
@@ -45,6 +50,7 @@ dxgi-mirror.exe [options]
   --target N     Target monitor (default: 1)
   --stretch      Stretch to fill (ignore aspect ratio)
   --no-tonemap   Disable HDR to SDR tonemapping
+  --sdr-white N  SDR white level in nits (default: 240)
   --list         List monitors
 ```
 

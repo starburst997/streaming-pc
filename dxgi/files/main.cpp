@@ -1,7 +1,7 @@
 // DXGI Desktop Mirror - Low-latency display mirroring
 // Capture thread: captures at source refresh rate
 // Render thread: presents with VSync at target refresh rate
-// Supports HDR to SDR tonemapping (Reinhard)
+// Supports HDR to SDR tonemapping (maxRGB Reinhard)
 //
 // Build: cl /O2 /EHsc main.cpp /link d3d11.lib dxgi.lib d3dcompiler.lib user32.lib winmm.lib
 
@@ -62,28 +62,44 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return float4(color.rgb, 1.0);
 })";
 
-// HDR to SDR pixel shader with Reinhard tonemapping
-// Based on OBS Studio's color.effect implementation
-// Input: scRGB (linear RGB, values can exceed 1.0 for HDR)
+// HDR to SDR pixel shader with tonemapping
+// Input: scRGB (linear RGB, 1.0 = 80 nits, values can exceed 1.0 for HDR)
 // Output: sRGB (gamma-corrected, 0-1 range)
+//
+// References:
+// - https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
+// - https://github.com/obsproject/obs-studio/blob/master/libobs/data/color.effect
 const char* g_PixelShaderHDR = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
+cbuffer Constants : register(b0) {
+    float sdrWhiteNits;
+    float padding1;
+    float padding2;
+    float padding3;
+};
+
 // sRGB OETF (linear to gamma)
-// Note: 'linear' is a reserved keyword in HLSL, so we use 'lin'
 float3 lin_to_srgb(float3 lin) {
     float3 srgb;
-    srgb.r = lin.r <= 0.0031308 ? 12.92 * lin.r : 1.055 * pow(lin.r, 1.0/2.4) - 0.055;
-    srgb.g = lin.g <= 0.0031308 ? 12.92 * lin.g : 1.055 * pow(lin.g, 1.0/2.4) - 0.055;
-    srgb.b = lin.b <= 0.0031308 ? 12.92 * lin.b : 1.055 * pow(lin.b, 1.0/2.4) - 0.055;
+    srgb.r = lin.r <= 0.0031308 ? 12.92 * lin.r : 1.055 * pow(abs(lin.r), 1.0/2.4) - 0.055;
+    srgb.g = lin.g <= 0.0031308 ? 12.92 * lin.g : 1.055 * pow(abs(lin.g), 1.0/2.4) - 0.055;
+    srgb.b = lin.b <= 0.0031308 ? 12.92 * lin.b : 1.055 * pow(abs(lin.b), 1.0/2.4) - 0.055;
     return srgb;
 }
 
-// Reinhard tonemapping (simple, fast, good enough)
-// Maps HDR [0, inf) to SDR [0, 1)
-float3 reinhard(float3 hdr) {
-    return hdr / (hdr + 1.0);
+// Attempt to match OBS's maxRGB Reinhard tonemapping (simpler, preserves colors better)
+// This is what OBS uses with their default tonemapping
+float3 reinhardMaxRGB(float3 x) {
+    float maxRGB = max(max(x.r, x.g), x.b);
+    if (maxRGB > 1.0) {
+        float scale = 1.0 / maxRGB;  // Simple Reinhard: x / (1 + x) when maxRGB >> 1
+        scale = maxRGB / (1.0 + maxRGB);  // Proper Reinhard
+        scale /= maxRGB;
+        x *= scale;
+    }
+    return x;
 }
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
@@ -92,10 +108,21 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     // scRGB can have negative values for wide gamut - clamp to 0
     color.rgb = max(color.rgb, 0.0);
 
-    // Reinhard tonemap
-    color.rgb = reinhard(color.rgb);
+    // Normalize scRGB to SDR range
+    // scRGB: 1.0 = 80 nits (SDR reference white per spec)
+    // Windows SDR white slider typically 80-480 nits
+    // We need to scale down by the ratio so that "SDR white" maps to 1.0
+    float scale = 80.0 / sdrWhiteNits;
+    color.rgb *= scale;
 
-    // Convert linear to sRGB gamma
+    // Apply maxRGB Reinhard tonemapping for values > 1.0
+    // This preserves SDR content (values <= 1.0) perfectly
+    color.rgb = reinhardMaxRGB(color.rgb);
+
+    // Clamp to valid range
+    color.rgb = saturate(color.rgb);
+
+    // Convert linear to sRGB gamma for display
     color.rgb = lin_to_srgb(color.rgb);
 
     return float4(color.rgb, 1.0);
@@ -147,6 +174,7 @@ struct {
     int targetMonitor = 1;
     bool preserveAspect = true;
     bool tonemap = true;  // HDR to SDR tonemapping (can be disabled with --no-tonemap)
+    float sdrWhiteNits = 240.0f;  // SDR white level in nits (matches OBS default)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -165,6 +193,7 @@ struct {
     ID3D11PixelShader* psHDR = nullptr;
     ID3D11InputLayout* layout = nullptr;
     ID3D11Buffer* vb = nullptr;
+    ID3D11Buffer* cbHDR = nullptr;  // Constant buffer for HDR shader
     ID3D11SamplerState* sampler = nullptr;
 
     // Capture thread resources
@@ -359,6 +388,14 @@ void InitShaders() {
     D3D11_SAMPLER_DESC sampd = {}; sampd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampd.AddressU = sampd.AddressV = sampd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     g.device->CreateSamplerState(&sampd, &g.sampler);
+
+    // Constant buffer for HDR shader (sdrWhiteNits value)
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 16;  // 4 floats (16 bytes, minimum cbuffer size)
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g.device->CreateBuffer(&cbd, nullptr, &g.cbHDR);
 }
 
 void InitDuplication() {
@@ -529,7 +566,7 @@ void CaptureThreadFunc() {
 
                     if (g.sourceIsHDR) {
                         if (g.tonemap) {
-                            printf("  Processing: Reinhard tonemapping (HDR to SDR)\n");
+                            printf("  Processing: maxRGB Reinhard tonemapping (HDR to SDR, sdrWhite=%.0f nits)\n", g.sdrWhiteNits);
                         } else {
                             printf("  Processing: None (--no-tonemap, HDR values may clip)\n");
                         }
@@ -634,6 +671,17 @@ void Render() {
     // - sourceIsHDR (actual R16G16B16A16_FLOAT): use HDR tonemapping shader
     // - SDR source: use passthrough shader
     if (g.sourceIsHDR && g.tonemap) {
+        // Update HDR constant buffer with sdrWhiteNits value
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(g.context->Map(g.cbHDR, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            float* data = (float*)mapped.pData;
+            data[0] = g.sdrWhiteNits;
+            data[1] = 0.0f;  // padding
+            data[2] = 0.0f;
+            data[3] = 0.0f;
+            g.context->Unmap(g.cbHDR, 0);
+        }
+        g.context->PSSetConstantBuffers(0, 1, &g.cbHDR);
         g.context->PSSetShader(g.psHDR, 0, 0);
     } else {
         g.context->PSSetShader(g.psSDR, 0, 0);
@@ -676,6 +724,7 @@ void Cleanup() {
 
     // Release render resources
     if (g.sampler) { g.sampler->Release(); g.sampler = nullptr; }
+    if (g.cbHDR) { g.cbHDR->Release(); g.cbHDR = nullptr; }
     if (g.vb) { g.vb->Release(); g.vb = nullptr; }
     if (g.layout) { g.layout->Release(); g.layout = nullptr; }
     if (g.psHDR) { g.psHDR->Release(); g.psHDR = nullptr; }
@@ -696,6 +745,8 @@ void PrintUsage(const char* prog) {
     printf("  --target N     Target monitor (default: 1)\n");
     printf("  --stretch      Stretch to fill (ignore aspect ratio)\n");
     printf("  --no-tonemap   Disable HDR to SDR tonemapping\n");
+    printf("  --sdr-white N  SDR white level in nits for HDR tonemapping (default: 240)\n");
+    printf("                 Check Windows Settings > Display > HDR > SDR content brightness\n");
     printf("  --debug        Enable debug output\n");
     printf("  --list         List monitors\n");
 }
@@ -711,6 +762,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--target") && i+1 < argc) g.targetMonitor = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stretch")) g.preserveAspect = false;
         else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
+        else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--debug")) g.debug = true;
         else if (!strcmp(argv[i], "--list")) { PrintMonitors(); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { PrintUsage(argv[0]); return 0; }
