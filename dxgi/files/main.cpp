@@ -139,6 +139,171 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return color;  // Alpha blending handled by blend state
 })";
 
+// Lanczos scaling shader - highest quality downscaling
+// Uses Lanczos3 kernel (3 lobes) for sharp, artifact-free results
+// Includes optional HDR tonemapping
+const char* g_PixelShaderLanczos = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer ScaleConstants : register(b0) {
+    float2 texSize;      // Source texture size
+    float2 invTexSize;   // 1.0 / texSize
+    float sdrWhiteNits;  // SDR white level for HDR tonemapping
+    float enableHDR;     // 1.0 = HDR tonemapping enabled
+    float2 padding;
+};
+
+#define PI 3.14159265359
+#define LANCZOS_LOBES 3.0
+
+float lanczos(float x) {
+    if (x == 0.0) return 1.0;
+    if (abs(x) >= LANCZOS_LOBES) return 0.0;
+    float pix = PI * x;
+    return (sin(pix) / pix) * (sin(pix / LANCZOS_LOBES) / (pix / LANCZOS_LOBES));
+}
+
+float3 lin_to_srgb(float3 lin) {
+    float3 srgb;
+    srgb.r = lin.r <= 0.0031308 ? 12.92 * lin.r : 1.055 * pow(abs(lin.r), 1.0/2.4) - 0.055;
+    srgb.g = lin.g <= 0.0031308 ? 12.92 * lin.g : 1.055 * pow(abs(lin.g), 1.0/2.4) - 0.055;
+    srgb.b = lin.b <= 0.0031308 ? 12.92 * lin.b : 1.055 * pow(abs(lin.b), 1.0/2.4) - 0.055;
+    return srgb;
+}
+
+float3 reinhardMaxRGB(float3 x) {
+    float maxRGB = max(max(x.r, x.g), x.b);
+    if (maxRGB > 1.0) {
+        float scale = maxRGB / (1.0 + maxRGB);
+        scale /= maxRGB;
+        x *= scale;
+    }
+    return x;
+}
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float2 texCoord = uv * texSize;
+    float2 center = floor(texCoord - 0.5) + 0.5;
+
+    float4 color = float4(0, 0, 0, 0);
+    float weight = 0.0;
+
+    // Sample in a 6x6 grid for Lanczos3
+    for (int y = -2; y <= 3; y++) {
+        for (int x = -2; x <= 3; x++) {
+            float2 samplePos = center + float2(x, y);
+            float2 delta = texCoord - samplePos;
+            float w = lanczos(delta.x) * lanczos(delta.y);
+            color += tex.SampleLevel(samp, samplePos * invTexSize, 0) * w;
+            weight += w;
+        }
+    }
+
+    color /= weight;
+
+    // Apply HDR tonemapping if enabled
+    if (enableHDR > 0.5) {
+        color.rgb = max(color.rgb, 0.0);
+        color.rgb *= 80.0 / sdrWhiteNits;
+        color.rgb = reinhardMaxRGB(color.rgb);
+        color.rgb = saturate(color.rgb);
+        color.rgb = lin_to_srgb(color.rgb);
+    }
+
+    return float4(color.rgb, 1.0);
+})";
+
+// Bicubic scaling shader - good quality, faster than Lanczos
+// Uses Catmull-Rom spline (sharper than Mitchell-Netravali)
+// Includes optional HDR tonemapping
+const char* g_PixelShaderBicubic = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer ScaleConstants : register(b0) {
+    float2 texSize;      // Source texture size
+    float2 invTexSize;   // 1.0 / texSize
+    float sdrWhiteNits;  // SDR white level for HDR tonemapping
+    float enableHDR;     // 1.0 = HDR tonemapping enabled
+    float2 padding;
+};
+
+float3 lin_to_srgb(float3 lin) {
+    float3 srgb;
+    srgb.r = lin.r <= 0.0031308 ? 12.92 * lin.r : 1.055 * pow(abs(lin.r), 1.0/2.4) - 0.055;
+    srgb.g = lin.g <= 0.0031308 ? 12.92 * lin.g : 1.055 * pow(abs(lin.g), 1.0/2.4) - 0.055;
+    srgb.b = lin.b <= 0.0031308 ? 12.92 * lin.b : 1.055 * pow(abs(lin.b), 1.0/2.4) - 0.055;
+    return srgb;
+}
+
+float3 reinhardMaxRGB(float3 x) {
+    float maxRGB = max(max(x.r, x.g), x.b);
+    if (maxRGB > 1.0) {
+        float scale = maxRGB / (1.0 + maxRGB);
+        scale /= maxRGB;
+        x *= scale;
+    }
+    return x;
+}
+
+// Catmull-Rom weights
+float4 cubic(float x) {
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float4 w;
+    w.x = -x3 + 2.0*x2 - x;
+    w.y = 3.0*x3 - 5.0*x2 + 2.0;
+    w.z = -3.0*x3 + 4.0*x2 + x;
+    w.w = x3 - x2;
+    return w / 2.0;
+}
+
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float2 texCoord = uv * texSize - 0.5;
+    float2 fxy = frac(texCoord);
+    texCoord = floor(texCoord);
+
+    float4 xcubic = cubic(fxy.x);
+    float4 ycubic = cubic(fxy.y);
+
+    float4 c = texCoord.xxyy + float4(-0.5, 1.5, -0.5, 1.5);
+    float4 s = float4(xcubic.x + xcubic.y, xcubic.z + xcubic.w,
+                      ycubic.x + ycubic.y, ycubic.z + ycubic.w);
+    float4 offset = c + float4(xcubic.y, xcubic.w, ycubic.y, ycubic.w) / s;
+
+    offset *= invTexSize.xxyy;
+
+    float4 sample0 = tex.SampleLevel(samp, offset.xz, 0);
+    float4 sample1 = tex.SampleLevel(samp, offset.yz, 0);
+    float4 sample2 = tex.SampleLevel(samp, offset.xw, 0);
+    float4 sample3 = tex.SampleLevel(samp, offset.yw, 0);
+
+    float sx = s.x / (s.x + s.y);
+    float sy = s.z / (s.z + s.w);
+
+    float4 color = lerp(lerp(sample3, sample2, sx), lerp(sample1, sample0, sx), sy);
+
+    // Apply HDR tonemapping if enabled
+    if (enableHDR > 0.5) {
+        color.rgb = max(color.rgb, 0.0);
+        color.rgb *= 80.0 / sdrWhiteNits;
+        color.rgb = reinhardMaxRGB(color.rgb);
+        color.rgb = saturate(color.rgb);
+        color.rgb = lin_to_srgb(color.rgb);
+    }
+
+    return float4(color.rgb, 1.0);
+})";
+
+// Scaling filter types
+enum ScaleFilter {
+    SCALE_POINT = 0,     // Nearest neighbor - fastest, blocky
+    SCALE_BILINEAR,      // Linear interpolation - smooth but soft
+    SCALE_BICUBIC,       // Catmull-Rom cubic - good balance
+    SCALE_LANCZOS        // Lanczos3 - highest quality (default)
+};
+
 struct Vertex { float x, y, u, v; };
 Vertex g_Quad[] = {{-1,1,0,0}, {1,1,1,0}, {-1,-1,0,1}, {1,-1,1,1}};
 
@@ -228,6 +393,7 @@ struct {
     bool useWaitableSwapChain = true;  // Use waitable swap chain for frame pacing
     bool useFrameDelay = true;  // Add small delay after waitable for consistent frame selection
     int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
+    ScaleFilter scaleFilter = SCALE_LANCZOS;  // Scaling filter (default: highest quality)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -244,10 +410,14 @@ struct {
     ID3D11PixelShader* psSDR = nullptr;
     ID3D11PixelShader* psSDRGamma = nullptr;  // For HDR monitor giving SDR format
     ID3D11PixelShader* psHDR = nullptr;
+    ID3D11PixelShader* psLanczos = nullptr;   // Lanczos scaling shader
+    ID3D11PixelShader* psBicubic = nullptr;   // Bicubic scaling shader
     ID3D11InputLayout* layout = nullptr;
     ID3D11Buffer* vb = nullptr;
     ID3D11Buffer* cbHDR = nullptr;  // Constant buffer for HDR shader
-    ID3D11SamplerState* sampler = nullptr;
+    ID3D11Buffer* cbScale = nullptr;  // Constant buffer for scale shaders
+    ID3D11SamplerState* sampler = nullptr;  // Linear sampler (bilinear)
+    ID3D11SamplerState* samplerPoint = nullptr;  // Point sampler (nearest neighbor)
 
     // Cursor resources
     ID3D11PixelShader* psCursor = nullptr;
@@ -494,9 +664,15 @@ void InitShaders() {
     D3D11_SUBRESOURCE_DATA sd = {g_Quad};
     g.device->CreateBuffer(&bd, &sd, &g.vb);
 
+    // Linear sampler (bilinear filtering)
     D3D11_SAMPLER_DESC sampd = {}; sampd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampd.AddressU = sampd.AddressV = sampd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     g.device->CreateSamplerState(&sampd, &g.sampler);
+
+    // Point sampler (nearest neighbor filtering)
+    D3D11_SAMPLER_DESC sampdPoint = {}; sampdPoint.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampdPoint.AddressU = sampdPoint.AddressV = sampdPoint.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    g.device->CreateSamplerState(&sampdPoint, &g.samplerPoint);
 
     // Constant buffer for HDR shader (sdrWhiteNits value)
     D3D11_BUFFER_DESC cbd = {};
@@ -506,17 +682,40 @@ void InitShaders() {
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g.device->CreateBuffer(&cbd, nullptr, &g.cbHDR);
 
+    // Constant buffer for scale shaders (texSize, invTexSize, sdrWhiteNits, enableHDR)
+    cbd.ByteWidth = 32;  // 8 floats
+    g.device->CreateBuffer(&cbd, nullptr, &g.cbScale);
+
+    // Lanczos scaling shader
+    hr = D3DCompile(g_PixelShaderLanczos, strlen(g_PixelShaderLanczos), "PS_Lanczos", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
+    if (FAILED(hr)) {
+        if (err) fprintf(stderr, "PS Lanczos compile error: %s\n", (char*)err->GetBufferPointer());
+        Fatal("PS Lanczos compile");
+    }
+    g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psLanczos);
+    blob->Release();
+
+    // Bicubic scaling shader
+    hr = D3DCompile(g_PixelShaderBicubic, strlen(g_PixelShaderBicubic), "PS_Bicubic", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
+    if (FAILED(hr)) {
+        if (err) fprintf(stderr, "PS Bicubic compile error: %s\n", (char*)err->GetBufferPointer());
+        Fatal("PS Bicubic compile");
+    }
+    g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psBicubic);
+    blob->Release();
+
     // Cursor pixel shader
     hr = D3DCompile(g_PixelShaderCursor, strlen(g_PixelShaderCursor), "PS_Cursor", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
     if (FAILED(hr)) Fatal("PS Cursor compile");
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psCursor);
     blob->Release();
 
-    // Blend state for cursor alpha blending (straight alpha)
-    // Using straight alpha blend as it's more compatible with various cursor formats
+    // Blend state for cursor alpha blending (premultiplied alpha)
+    // Windows cursors use premultiplied alpha: RGB already multiplied by A
+    // Blend equation: finalColor = srcColor + destColor * (1 - srcAlpha)
     D3D11_BLEND_DESC blendDesc = {};
     blendDesc.RenderTarget[0].BlendEnable = TRUE;
-    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;  // Premultiplied: use RGB as-is
     blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
     blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
@@ -854,28 +1053,57 @@ void Render() {
 
     g.context->VSSetShader(g.vs, 0, 0);
 
-    // Select pixel shader based on source format:
-    // - sourceIsHDR (actual R16G16B16A16_FLOAT): use HDR tonemapping shader
-    // - SDR source: use passthrough shader
-    if (g.sourceIsHDR && g.tonemap) {
-        // Update HDR constant buffer with sdrWhiteNits value
+    // Select pixel shader and sampler based on scale filter and source format
+    ID3D11SamplerState* currentSampler = g.sampler;  // Default: linear (bilinear)
+    bool useScaleShader = false;
+
+    if (g.scaleFilter == SCALE_POINT) {
+        currentSampler = g.samplerPoint;
+    } else if (g.scaleFilter == SCALE_BICUBIC || g.scaleFilter == SCALE_LANCZOS) {
+        useScaleShader = true;
+    }
+
+    if (useScaleShader) {
+        // Use Lanczos or Bicubic shader with integrated HDR support
         D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(g.context->Map(g.cbHDR, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        if (SUCCEEDED(g.context->Map(g.cbScale, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             float* data = (float*)mapped.pData;
-            data[0] = g.sdrWhiteNits;
-            data[1] = 0.0f;  // padding
-            data[2] = 0.0f;
-            data[3] = 0.0f;
-            g.context->Unmap(g.cbHDR, 0);
+            // Get source texture dimensions
+            float srcW = (float)(g.sourceRect.right - g.sourceRect.left);
+            float srcH = (float)(g.sourceRect.bottom - g.sourceRect.top);
+            data[0] = srcW;                    // texSize.x
+            data[1] = srcH;                    // texSize.y
+            data[2] = 1.0f / srcW;             // invTexSize.x
+            data[3] = 1.0f / srcH;             // invTexSize.y
+            data[4] = g.sdrWhiteNits;          // sdrWhiteNits
+            data[5] = (g.sourceIsHDR && g.tonemap) ? 1.0f : 0.0f;  // enableHDR
+            data[6] = 0.0f;                    // padding
+            data[7] = 0.0f;                    // padding
+            g.context->Unmap(g.cbScale, 0);
         }
-        g.context->PSSetConstantBuffers(0, 1, &g.cbHDR);
-        g.context->PSSetShader(g.psHDR, 0, 0);
+        g.context->PSSetConstantBuffers(0, 1, &g.cbScale);
+        g.context->PSSetShader(g.scaleFilter == SCALE_LANCZOS ? g.psLanczos : g.psBicubic, 0, 0);
     } else {
-        g.context->PSSetShader(g.psSDR, 0, 0);
+        // Use standard SDR/HDR shader with sampler-based filtering
+        if (g.sourceIsHDR && g.tonemap) {
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(g.context->Map(g.cbHDR, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                float* data = (float*)mapped.pData;
+                data[0] = g.sdrWhiteNits;
+                data[1] = 0.0f;  // padding
+                data[2] = 0.0f;
+                data[3] = 0.0f;
+                g.context->Unmap(g.cbHDR, 0);
+            }
+            g.context->PSSetConstantBuffers(0, 1, &g.cbHDR);
+            g.context->PSSetShader(g.psHDR, 0, 0);
+        } else {
+            g.context->PSSetShader(g.psSDR, 0, 0);
+        }
     }
 
     g.context->PSSetShaderResources(0, 1, &srv);
-    g.context->PSSetSamplers(0, 1, &g.sampler);
+    g.context->PSSetSamplers(0, 1, &currentSampler);
 
     UINT stride = sizeof(Vertex), offset = 0;
     g.context->IASetVertexBuffers(0, 1, &g.vb, &stride, &offset);
@@ -915,6 +1143,7 @@ void Render() {
 
             if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
                 // Monochrome: AND mask then XOR mask, each 1 bit per pixel
+                // Output in premultiplied alpha format
                 UINT pitch = g.cursor.shapePitch;
                 for (UINT y = 0; y < height; y++) {
                     for (UINT x = 0; x < width; x++) {
@@ -924,50 +1153,63 @@ void Render() {
                         BYTE xorMask = (g.cursor.shapeBuffer[(y + height) * pitch + byteIdx] >> bitIdx) & 1;
 
                         if (andMask == 0 && xorMask == 0) {
-                            pixels[y * width + x] = 0xFF000000;  // Black, opaque
+                            // Black, opaque (premul: RGB=0, A=255)
+                            pixels[y * width + x] = 0xFF000000;
                         } else if (andMask == 0 && xorMask == 1) {
-                            pixels[y * width + x] = 0xFFFFFFFF;  // White, opaque
+                            // White, opaque (premul: RGB=255, A=255)
+                            pixels[y * width + x] = 0xFFFFFFFF;
                         } else if (andMask == 1 && xorMask == 0) {
-                            pixels[y * width + x] = 0x00000000;  // Transparent
+                            // Transparent (premul: all zero)
+                            pixels[y * width + x] = 0x00000000;
                         } else {
-                            // XOR (invert) - render as semi-transparent white
-                            pixels[y * width + x] = 0x80FFFFFF;
+                            // XOR (invert) - approximate as semi-transparent white
+                            // Premul: RGB=128 (255*0.5), A=128
+                            pixels[y * width + x] = 0x80808080;
                         }
                     }
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
-                // Color cursor: BGRA format with proper alpha channel
-                // These cursors use standard alpha blending:
-                // - Alpha = 0: fully transparent
-                // - Alpha = 255: fully opaque
-                // - Alpha values in between: semi-transparent
-                // Note: Don't treat black as transparent - that breaks I-beam cursors!
+                // Color cursor: BGRA format, already premultiplied alpha from Windows
+                // Just copy the data directly - it's ready for premultiplied blending
                 for (UINT y = 0; y < height; y++) {
                     for (UINT x = 0; x < width; x++) {
                         BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
-                        BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
-                        // Use alpha channel directly - this is the standard format
-                        pixels[y * width + x] = (a << 24) | (r << 16) | (gc << 8) | b;
+                        // BGRA format: copy as-is (already premultiplied)
+                        pixels[y * width + x] = *(UINT*)src;
                     }
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
                 // Masked color cursor format:
-                // - Alpha = 0x00: XOR pixel (invert) - we approximate with semi-transparent
+                // - Alpha = 0x00: XOR pixel (invert background) - approximate as inverted color
                 // - Alpha = 0xFF: Replace pixel with RGB color (solid cursor pixel)
+                // Output in premultiplied alpha format
                 for (UINT y = 0; y < height; y++) {
                     for (UINT x = 0; x < width; x++) {
                         BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
                         BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
 
                         if (a == 0xFF) {
-                            // Solid pixel - use the color with full opacity
+                            // Solid pixel - fully opaque (premul: RGB as-is, A=255)
                             pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
-                        } else if (a == 0 && (r | gc | b) != 0) {
-                            // XOR pixel with color - approximate as semi-transparent
-                            pixels[y * width + x] = 0x80000000 | (r << 16) | (gc << 8) | b;
+                        } else if (a == 0) {
+                            // XOR pixel - approximate by showing the color with high visibility
+                            // Use ~75% opacity for XOR approximation
+                            // Premul: RGB * 0.75, A = 192
+                            BYTE pr = (BYTE)(r * 192 / 255);
+                            BYTE pg = (BYTE)(gc * 192 / 255);
+                            BYTE pb = (BYTE)(b * 192 / 255);
+                            // If color is black, use white instead (for visibility on dark backgrounds)
+                            if (r == 0 && gc == 0 && b == 0) {
+                                pixels[y * width + x] = 0xC0C0C0C0;  // Semi-transparent white
+                            } else {
+                                pixels[y * width + x] = (192 << 24) | (pr << 16) | (pg << 8) | pb;
+                            }
                         } else {
-                            // Transparent
-                            pixels[y * width + x] = 0x00000000;
+                            // Partial alpha - treat as premultiplied
+                            BYTE pr = (BYTE)(r * a / 255);
+                            BYTE pg = (BYTE)(gc * a / 255);
+                            BYTE pb = (BYTE)(b * a / 255);
+                            pixels[y * width + x] = (a << 24) | (pr << 16) | (pg << 8) | pb;
                         }
                     }
                 }
@@ -1082,10 +1324,14 @@ void Cleanup() {
     delete[] g.cursor.shapeBuffer; g.cursor.shapeBuffer = nullptr;
 
     // Release render resources
+    if (g.samplerPoint) { g.samplerPoint->Release(); g.samplerPoint = nullptr; }
     if (g.sampler) { g.sampler->Release(); g.sampler = nullptr; }
+    if (g.cbScale) { g.cbScale->Release(); g.cbScale = nullptr; }
     if (g.cbHDR) { g.cbHDR->Release(); g.cbHDR = nullptr; }
     if (g.vb) { g.vb->Release(); g.vb = nullptr; }
     if (g.layout) { g.layout->Release(); g.layout = nullptr; }
+    if (g.psBicubic) { g.psBicubic->Release(); g.psBicubic = nullptr; }
+    if (g.psLanczos) { g.psLanczos->Release(); g.psLanczos = nullptr; }
     if (g.psHDR) { g.psHDR->Release(); g.psHDR = nullptr; }
     if (g.psSDRGamma) { g.psSDRGamma->Release(); g.psSDRGamma = nullptr; }
     if (g.psSDR) { g.psSDR->Release(); g.psSDR = nullptr; }
@@ -1106,6 +1352,8 @@ void PrintUsage(const char* prog) {
     printf("  --stretch        Stretch to fill (ignore aspect ratio)\n");
     printf("  --no-tonemap     Disable HDR to SDR tonemapping\n");
     printf("  --sdr-white N    SDR white level in nits for HDR tonemapping (default: 240)\n");
+    printf("  --scale FILTER   Scaling filter: point, bilinear, bicubic, lanczos (default: lanczos)\n");
+    printf("                   lanczos = highest quality, best for 4K->1080p downscaling\n");
     printf("  --no-cursor      Hide the mouse cursor\n");
     printf("  --no-waitable    Disable waitable swap chain (frame pacing)\n");
     printf("  --no-smart-select Disable smart frame selection (use fixed delay)\n");
@@ -1128,6 +1376,14 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
         else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-cursor")) g.showCursor = false;
+        else if (!strcmp(argv[i], "--scale") && i+1 < argc) {
+            i++;
+            if (!strcmp(argv[i], "point")) g.scaleFilter = SCALE_POINT;
+            else if (!strcmp(argv[i], "bilinear")) g.scaleFilter = SCALE_BILINEAR;
+            else if (!strcmp(argv[i], "bicubic")) g.scaleFilter = SCALE_BICUBIC;
+            else if (!strcmp(argv[i], "lanczos")) g.scaleFilter = SCALE_LANCZOS;
+            else { fprintf(stderr, "Unknown scale filter: %s\n", argv[i]); return 1; }
+        }
         else if (!strcmp(argv[i], "--no-waitable")) g.useWaitableSwapChain = false;
         else if (!strcmp(argv[i], "--no-smart-select")) g.useSmartFrameSelection = false;
         else if (!strcmp(argv[i], "--no-frame-delay")) g.useFrameDelay = false;
@@ -1194,6 +1450,10 @@ int main(int argc, char** argv) {
         } else {
             printf("  Frame pacing: None (immediate)\n");
         }
+
+        // Print scaling filter
+        const char* scaleNames[] = {"Point (nearest)", "Bilinear", "Bicubic (Catmull-Rom)", "Lanczos3 (highest quality)"};
+        printf("  Scale filter: %s\n", scaleNames[g.scaleFilter]);
     }
 
     // Triple buffer is initialized by capture thread on first frame

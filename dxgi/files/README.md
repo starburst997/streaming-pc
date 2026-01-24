@@ -12,6 +12,17 @@ Triple-buffered staging textures ensure lock-free operation with no flicker. Use
 
 **Smart frame selection**: When source rate > target rate, the render thread waits for a specific frame ID (last + N) rather than using a fixed delay. This guarantees consistent frame skipping (e.g., Skip:2-2 for 120Hz→60Hz) regardless of system timing variations.
 
+## Scaling Quality
+
+When source and target resolutions differ (e.g., 4K → 1080p), the program applies high-quality scaling:
+
+- **Lanczos3** (default): Highest quality, uses a 6x6 kernel with sinc-based weights. Preserves sharpness and detail, ideal for gaming and video content. Slightly more GPU-intensive.
+- **Bicubic** (Catmull-Rom): Good quality with sharper results than bilinear. Uses a 4x4 kernel. Good balance of quality and performance.
+- **Bilinear**: Simple linear interpolation. Smooth but can appear soft/blurry.
+- **Point**: Nearest neighbor sampling. Fastest but blocky, only use for pixel art.
+
+For 4K to 1080p downscaling, Lanczos provides the best visual quality with minimal artifacts.
+
 ## HDR Support
 
 When the source monitor is HDR (DXGI_FORMAT_R16G16B16A16_FLOAT / scRGB), the program automatically applies **maxRGB Reinhard tonemapping** to convert to SDR for display on SDR monitors.
@@ -57,6 +68,11 @@ dxgi-mirror.exe [options]
   --stretch        Stretch to fill (ignore aspect ratio)
   --no-tonemap     Disable HDR to SDR tonemapping
   --sdr-white N    SDR white level in nits (default: 240)
+  --scale FILTER   Scaling filter for resolution changes (default: lanczos)
+                   point    - Nearest neighbor (fastest, blocky)
+                   bilinear - Linear interpolation (smooth but soft)
+                   bicubic  - Catmull-Rom (good quality, fast)
+                   lanczos  - Lanczos3 (highest quality, best for 4K→1080p)
   --no-cursor      Hide the mouse cursor
   --no-waitable    Disable waitable swap chain (frame pacing)
   --no-smart-select Disable smart frame selection (use fixed delay)
