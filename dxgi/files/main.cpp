@@ -515,25 +515,35 @@ struct
 
 void Cleanup();
 
-// High-precision microsecond delay using spin-wait
-// Sleep() only has ~1ms precision, this gives µs precision
+// High-precision microsecond delay
+// Uses Sleep(1) for bulk waiting (requires timeBeginPeriod(1) to be active)
+// Spins only for final sub-millisecond precision
 void DelayMicroseconds(int us)
 {
     if (us <= 0)
         return;
 
-    LARGE_INTEGER freq, start, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-
-    double targetTicks = (double)us * freq.QuadPart / 1000000.0;
-    LONGLONG endTicks = start.QuadPart + (LONGLONG)targetTicks;
-
-    // Spin-wait for precise timing
-    do
+    // For delays > 1.5ms, use Sleep(1) which is ~1-2ms with timeBeginPeriod(1)
+    while (us > 1500)
     {
-        QueryPerformanceCounter(&now);
-    } while (now.QuadPart < endTicks);
+        Sleep(1);
+        us -= 1000; // Assume ~1ms actual sleep
+    }
+
+    // Spin for remaining sub-millisecond precision
+    if (us > 0)
+    {
+        LARGE_INTEGER freq, start, now;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+        LONGLONG endTicks = start.QuadPart + (LONGLONG)((double)us * freq.QuadPart / 1000000.0);
+
+        do
+        {
+            _mm_pause();
+            QueryPerformanceCounter(&now);
+        } while (now.QuadPart < endTicks);
+    }
 }
 
 void Fatal(const char *msg, HRESULT hr = 0)
@@ -1210,11 +1220,19 @@ void CaptureThreadFunc()
                 // This ensures the texture data is fully written before we publish
                 g.capContext->End(gpuFence);
                 g.capContext->Flush();
+                // Spin briefly (GPU copies are typically <100µs), then Sleep if needed
+                for (int spin = 0; spin < 1000; spin++)
+                {
+                    if (g.capContext->GetData(gpuFence, nullptr, 0, 0) != S_FALSE)
+                        goto fence_done;
+                    _mm_pause();
+                }
+                // If still waiting, use Sleep(1) to avoid burning CPU
                 while (g.capContext->GetData(gpuFence, nullptr, 0, 0) == S_FALSE)
                 {
-                    // Spin-wait for GPU copy completion (typically very fast)
-                    _mm_pause(); // CPU hint: we're spin-waiting
+                    Sleep(1);
                 }
+                fence_done:
                 QueryPerformanceCounter(&t2);
                 g.capTimeCopy.fetch_add((int)((t2.QuadPart - t1.QuadPart) * ticksToUs), std::memory_order_relaxed);
 
@@ -2085,15 +2103,16 @@ int main(int argc, char **argv)
                 // Calculate time remaining until deadline (in µs)
                 int remainingUs = (int)((deadlineTicks - elapsed) * 1000000 / freq.QuadPart);
 
-                if (remainingUs > 1000)
+                if (remainingUs > 2000)
                 {
-                    // More than 1ms until deadline - check every 1ms
-                    DelayMicroseconds(1000);
+                    // More than 2ms until deadline - Sleep(1) saves CPU
+                    // With timeBeginPeriod(1) active, Sleep(1) is ~1-2ms
+                    Sleep(1);
                 }
                 else
                 {
-                    // Last 1ms - check aggressively every 100µs
-                    DelayMicroseconds(100);
+                    // Last 2ms - just yield and check again
+                    _mm_pause();
                 }
 
                 // Check for new frame
@@ -2106,28 +2125,13 @@ int main(int argc, char **argv)
         // Use the actual acquired frame ID (set by Render), not the global capture counter
         UINT64 acquiredFrameId = g.lastAcquiredFrameId;
 
-        // SAFETY CHECK: Detect if frame went backward (should NEVER happen)
+        // Categorize this frame: new (unique), duplicate, or backward (bug)
         bool skipPresent = false;
-        if (acquiredFrameId > 0 && g.lastRenderedId > 0 && acquiredFrameId < g.lastRenderedId)
-        {
-            g.frameWentBackward.fetch_add(1, std::memory_order_relaxed);
-            // Log detailed info for debugging
-            printf("\n[BUG] Frame went BACKWARD! acquired=%llu last=%llu buf=%d (w=%d r=%d d=%d)\n",
-                   (unsigned long long)acquiredFrameId,
-                   (unsigned long long)g.lastRenderedId,
-                   g.lastAcquiredBufIdx,
-                   g.buffer.writeIdx.load(std::memory_order_relaxed),
-                   g.buffer.readyIdx.load(std::memory_order_relaxed),
-                   g.buffer.displayIdx.load(std::memory_order_relaxed));
-            // Skip presenting this bad frame
-            skipPresent = true;
-            dupCount++;
-        }
-        else if (acquiredFrameId > g.lastRenderedId)
+        if (acquiredFrameId > g.lastRenderedId)
         {
             // Frame is newer - this is normal forward progress
             // Track frame skip for smart-select mode
-            if (g.useSmartFrameSelection && g.lastRenderedId > 0 && acquiredFrameId > g.lastRenderedId)
+            if (g.useSmartFrameSelection && g.lastRenderedId > 0)
             {
                 int skipDelta = (int)(acquiredFrameId - g.lastRenderedId);
                 if (skipDelta < g.frameSkipMin)
@@ -2140,8 +2144,25 @@ int main(int argc, char **argv)
             uniqCount++;
             g.lastRenderedId = acquiredFrameId;
         }
+        else if (acquiredFrameId == g.lastRenderedId || acquiredFrameId == 0)
+        {
+            // Same frame as last time (duplicate) or no frame yet
+            dupCount++;
+        }
         else
         {
+            // acquiredFrameId < g.lastRenderedId - frame went BACKWARD (should NEVER happen)
+            g.frameWentBackward.fetch_add(1, std::memory_order_relaxed);
+            // Log detailed info for debugging
+            printf("\n[BUG] Frame went BACKWARD! acquired=%llu last=%llu buf=%d (w=%d r=%d d=%d)\n",
+                   (unsigned long long)acquiredFrameId,
+                   (unsigned long long)g.lastRenderedId,
+                   g.lastAcquiredBufIdx,
+                   g.buffer.writeIdx.load(std::memory_order_relaxed),
+                   g.buffer.readyIdx.load(std::memory_order_relaxed),
+                   g.buffer.displayIdx.load(std::memory_order_relaxed));
+            // Skip presenting this bad frame, count as dup
+            skipPresent = true;
             dupCount++;
         }
 
