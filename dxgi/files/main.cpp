@@ -391,10 +391,10 @@ struct {
     bool tonemap = true;  // HDR to SDR tonemapping (can be disabled with --no-tonemap)
     float sdrWhiteNits = 240.0f;  // SDR white level in nits (matches OBS default)
     bool showCursor = true;  // Show cursor (can be disabled with --no-cursor)
-    bool useWaitableSwapChain = true;  // Use waitable swap chain for frame pacing
-    bool useFrameDelay = true;  // Add small delay after waitable for consistent frame selection
+    bool useWaitableSwapChain = true;  // Use waitable swap chain for lower latency
+    bool useFrameDelay = false;  // Add small delay after waitable (disabled by default)
     int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
-    ScaleFilter scaleFilter = SCALE_BILINEAR;  // Scaling filter (default: bilinear, lanczos has issues)
+    ScaleFilter scaleFilter = SCALE_BICUBIC;  // Scaling filter (default: bicubic)
     int userTargetFps = -1;  // User-specified output FPS (-1 = auto-detect, 0 = no VSync)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
@@ -456,15 +456,21 @@ struct {
     UINT64 lastCaptureCheckId = 0;  // For detecting idle desktop
 
     // Frame pacing stats
+    // Frame pacing
+    HANDLE frameLatencyWaitable = nullptr;
+    int targetFrameSkip = 0;  // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
+    bool useSmartFrameSelection = false;  // Disabled by default - just show latest frame
+    bool waitForNewFrame = true;  // Wait for unique frame before rendering (reduces dups)
+    int waitForFrameTimeoutMs = 14;  // Max time to wait for new frame (ms), leave headroom for render
+
+    // Track actually rendered frame (set by Render, read by main loop)
+    UINT64 lastAcquiredFrameId = 0;
+
+    // Frame skip stats (for smart-select mode)
     int frameSkipMin = INT_MAX;
     int frameSkipMax = 0;
     int frameSkipTotal = 0;
     int frameSkipCount = 0;
-
-    // Frame pacing
-    HANDLE frameLatencyWaitable = nullptr;
-    int targetFrameSkip = 0;  // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
-    bool useSmartFrameSelection = true;  // Wait for correct frame ID instead of fixed delay
 
     std::thread captureThread;
 } g;
@@ -513,24 +519,61 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     return FALSE;
 }
 
-struct MonitorInfo { int index; RECT rect; };
-BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT rect, LPARAM data) {
+struct MonitorInfo {
+    int index;
+    RECT rect;
+    WCHAR deviceName[32];
+    float refreshRate;
+};
+
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT rect, LPARAM data) {
     auto* info = (MonitorInfo*)data;
-    if (info->index == 0) { info->rect = *rect; return FALSE; }
-    info->index--; return TRUE;
+    if (info->index == 0) {
+        info->rect = *rect;
+        // Get device name for this monitor
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(hMon, &mi)) {
+            wcscpy_s(info->deviceName, mi.szDevice);
+            // Get CURRENT refresh rate using EnumDisplaySettings
+            DEVMODEW devMode = {};
+            devMode.dmSize = sizeof(devMode);
+            if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &devMode)) {
+                info->refreshRate = (float)devMode.dmDisplayFrequency;
+            }
+        }
+        return FALSE;
+    }
+    info->index--;
+    return TRUE;
 }
+
 bool GetMonitorRect(int idx, RECT* rect) {
-    MonitorInfo info = {idx, {}};
+    MonitorInfo info = {idx, {}, L"", 0};
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
     *rect = info.rect;
     return info.index == 0 || (rect->right - rect->left) > 0;
 }
+
+// Get the actual current refresh rate for a monitor (not the max supported)
+float GetMonitorRefreshRate(int idx) {
+    MonitorInfo info = {idx, {}, L"", 60.0f};
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
+    return info.refreshRate;
+}
+
 int GetMonitorCount() { return GetSystemMetrics(SM_CMONITORS); }
+
 void PrintMonitors() {
     printf("Available monitors:\n");
     for (int i = 0; i < GetMonitorCount(); i++) {
-        RECT r; GetMonitorRect(i, &r);
-        printf("  %d: %dx%d at (%d,%d)\n", i, r.right-r.left, r.bottom-r.top, r.left, r.top);
+        MonitorInfo info = {i, {}, L"", 0};
+        EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
+        printf("  %d: %dx%d at (%d,%d) @ %.0fHz\n", i,
+               info.rect.right - info.rect.left,
+               info.rect.bottom - info.rect.top,
+               info.rect.left, info.rect.top,
+               info.refreshRate);
     }
 }
 
@@ -1024,7 +1067,10 @@ void Render() {
         return;
     }
 
-    int readIdx = g.buffer.AcquireFrame();
+    UINT64 acquiredFrameId = 0;
+    int readIdx = g.buffer.AcquireFrame(&acquiredFrameId);
+    g.lastAcquiredFrameId = acquiredFrameId;
+
     if (readIdx < 0) {
         if (g.debug && (++s_renderDebugCounter % 60 == 0)) {
             printf("[DEBUG] Render: no frame available (readIdx=%d, writeIdx=%d, readyIdx=%d, displayIdx=%d)\n",
@@ -1356,15 +1402,14 @@ void PrintUsage(const char* prog) {
     printf("  --stretch        Stretch to fill (ignore aspect ratio)\n");
     printf("  --no-tonemap     Disable HDR to SDR tonemapping\n");
     printf("  --sdr-white N    SDR white level in nits for HDR tonemapping (default: 240)\n");
-    printf("  --scale FILTER   Scaling filter: point, bilinear, bicubic, lanczos (default: lanczos)\n");
-    printf("                   lanczos = highest quality, best for 4K->1080p downscaling\n");
+    printf("  --scale FILTER   Scaling filter: point, bilinear, bicubic, lanczos (default: bicubic)\n");
     printf("  --no-cursor      Hide the mouse cursor\n");
     printf("  --out N          Target output FPS (default: auto-detect from monitor)\n");
     printf("                   Use 0 for no VSync (run as fast as possible)\n");
-    printf("  --no-waitable    Disable waitable swap chain (frame pacing)\n");
-    printf("  --no-smart-select Disable smart frame selection (use fixed delay)\n");
-    printf("  --no-frame-delay Disable frame delay (frame pacing fallback)\n");
-    printf("  --frame-delay N  Frame delay in microseconds (default: 1000 = 1ms)\n");
+    printf("  --no-waitable    Disable waitable swap chain\n");
+    printf("  --no-wait-frame  Disable waiting for new frame (may increase dups)\n");
+    printf("  --smart-select   Enable smart frame selection (wait for frame N+skip)\n");
+    printf("  --frame-delay N  Enable frame delay in microseconds (e.g., 1000 = 1ms)\n");
     printf("  --debug          Enable debug output\n");
     printf("  --list           List monitors\n");
 }
@@ -1392,9 +1437,9 @@ int main(int argc, char** argv) {
             else { fprintf(stderr, "Unknown scale filter: %s\n", argv[i]); return 1; }
         }
         else if (!strcmp(argv[i], "--no-waitable")) g.useWaitableSwapChain = false;
-        else if (!strcmp(argv[i], "--no-smart-select")) g.useSmartFrameSelection = false;
-        else if (!strcmp(argv[i], "--no-frame-delay")) g.useFrameDelay = false;
-        else if (!strcmp(argv[i], "--frame-delay") && i+1 < argc) g.frameDelayUs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-wait-frame")) g.waitForNewFrame = false;
+        else if (!strcmp(argv[i], "--smart-select")) g.useSmartFrameSelection = true;
+        else if (!strcmp(argv[i], "--frame-delay") && i+1 < argc) { g.frameDelayUs = atoi(argv[++i]); g.useFrameDelay = true; }
         else if (!strcmp(argv[i], "--debug")) g.debug = true;
         else if (!strcmp(argv[i], "--list")) { PrintMonitors(); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { PrintUsage(argv[0]); return 0; }
@@ -1421,55 +1466,38 @@ int main(int argc, char** argv) {
     InitDuplication();
     InitShaders();
 
-    // Detect target refresh rate from the swap chain
+    // Detect target refresh rate using actual current display mode
+    // (not FindClosestMatchingMode which returns max supported, wrong with VRR on Win11)
     {
-        IDXGIOutput* output = nullptr;
-        if (SUCCEEDED(g.swapChain->GetContainingOutput(&output))) {
-            DXGI_OUTPUT_DESC outputDesc;
-            output->GetDesc(&outputDesc);
-
-            DXGI_MODE_DESC modeDesc = {};
-            modeDesc.Width = g.windowWidth;
-            modeDesc.Height = g.windowHeight;
-            modeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-
-            DXGI_MODE_DESC closestMatch;
-            if (SUCCEEDED(output->FindClosestMatchingMode(&modeDesc, &closestMatch, g.device))) {
-                g.targetRefreshRate = (float)closestMatch.RefreshRate.Numerator / closestMatch.RefreshRate.Denominator;
-            }
-            output->Release();
-        }
+        g.targetRefreshRate = GetMonitorRefreshRate(g.targetMonitor);
 
         // Override with user-specified FPS if provided
         if (g.userTargetFps >= 0) {
             float detectedRate = g.targetRefreshRate;
             g.targetRefreshRate = (float)g.userTargetFps;
-            printf("  Target: %dHz (user override, detected: %.2fHz)\n", g.userTargetFps, detectedRate);
+            printf("  Target: %dHz (user override, detected: %.0fHz)\n", g.userTargetFps, detectedRate);
         } else {
-            printf("  Target: %.2fHz (auto-detected)\n", g.targetRefreshRate);
+            printf("  Target: %.0fHz (auto-detected)\n", g.targetRefreshRate);
         }
 
-        // Calculate target frame skip for smart frame selection
-        // e.g., 120Hz source / 60Hz target = 2 (show every 2nd frame)
+        // Calculate target frame skip (only used if smart-select is enabled)
         if (g.sourceRefreshRate > 0 && g.targetRefreshRate > 0) {
             g.targetFrameSkip = (int)round(g.sourceRefreshRate / g.targetRefreshRate);
             if (g.targetFrameSkip < 1) g.targetFrameSkip = 1;
-            printf("  Frame skip: %d (source %.0fHz / target %.0fHz)\n",
-                   g.targetFrameSkip, g.sourceRefreshRate, g.targetRefreshRate);
-        } else if (g.userTargetFps == 0) {
-            g.targetFrameSkip = 1;
-            printf("  Frame skip: 1 (no VSync, unlimited)\n");
         }
 
         // Print frame pacing strategy
         if (g.userTargetFps == 0) {
-            printf("  Frame pacing: None (no VSync, run as fast as possible)\n");
-        } else if (g.targetFrameSkip > 1 && g.useSmartFrameSelection) {
-            printf("  Frame pacing: Smart selection (wait for frame N+%d)\n", g.targetFrameSkip);
+            printf("  Frame pacing: None (no VSync, unlimited)\n");
+        } else if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
+            printf("  Frame pacing: Smart selection (skip %d, source %.0fHz / target %.0fHz)\n",
+                   g.targetFrameSkip, g.sourceRefreshRate, g.targetRefreshRate);
         } else if (g.useFrameDelay && g.frameDelayUs > 0) {
             printf("  Frame pacing: Fixed delay (%d us)\n", g.frameDelayUs);
+        } else if (g.waitForNewFrame) {
+            printf("  Frame pacing: Wait for new frame (up to %dms timeout)\n", g.waitForFrameTimeoutMs);
         } else {
-            printf("  Frame pacing: VSync only\n");
+            printf("  Frame pacing: VSync only (may show dups)\n");
         }
 
         // Print scaling filter
@@ -1559,24 +1587,60 @@ int main(int argc, char** argv) {
         }
         if (!g.running) break;
 
+        // Wait for a new frame if we would otherwise show a duplicate
+        // This significantly reduces dups when capture is faster than display
+        if (g.waitForNewFrame && g.bufferInitialized.load(std::memory_order_acquire)) {
+            LARGE_INTEGER waitStart, waitNow;
+            QueryPerformanceCounter(&waitStart);
+            LONGLONG timeoutTicks = (LONGLONG)g.waitForFrameTimeoutMs * freq.QuadPart / 1000;
+
+            // Check if the ready frame is different from last rendered
+            UINT64 readyId = g.buffer.GetReadyFrameId();
+            while (readyId == g.lastRenderedId || readyId == 0) {
+                QueryPerformanceCounter(&waitNow);
+                LONGLONG elapsed = waitNow.QuadPart - waitStart.QuadPart;
+
+                if (elapsed >= timeoutTicks) {
+                    // Timeout - render whatever we have
+                    break;
+                }
+
+                // Calculate remaining time in ms
+                int remainingMs = (int)((timeoutTicks - elapsed) * 1000 / freq.QuadPart);
+
+                if (remainingMs > 2) {
+                    // More than 2ms left - use Sleep(1) to be CPU-friendly
+                    Sleep(1);
+                } else if (remainingMs > 0) {
+                    // Less than 2ms - use Sleep(0) for faster response
+                    Sleep(0);
+                }
+                // In the last moments, spin-wait (no sleep)
+
+                // Check again
+                readyId = g.buffer.GetReadyFrameId();
+            }
+        }
+
         Render();
         // Present: sync interval 1 = VSync, 0 = no VSync (run as fast as possible)
         g.swapChain->Present(g.userTargetFps == 0 ? 0 : 1, 0);
 
         outCount++;
 
-        UINT64 currentFrameId = g.captureFrameId.load(std::memory_order_relaxed);
-        if (currentFrameId != g.lastRenderedId) {
-            // Track frame skip delta for pacing analysis
-            if (g.lastRenderedId > 0) {
-                int skipDelta = (int)(currentFrameId - g.lastRenderedId);
+        // Use the actual acquired frame ID (set by Render), not the global capture counter
+        UINT64 acquiredFrameId = g.lastAcquiredFrameId;
+        if (acquiredFrameId != g.lastRenderedId) {
+            // Track frame skip for smart-select mode
+            if (g.useSmartFrameSelection && g.lastRenderedId > 0 && acquiredFrameId > g.lastRenderedId) {
+                int skipDelta = (int)(acquiredFrameId - g.lastRenderedId);
                 if (skipDelta < g.frameSkipMin) g.frameSkipMin = skipDelta;
                 if (skipDelta > g.frameSkipMax) g.frameSkipMax = skipDelta;
                 g.frameSkipTotal += skipDelta;
                 g.frameSkipCount++;
             }
             uniqCount++;
-            g.lastRenderedId = currentFrameId;
+            g.lastRenderedId = acquiredFrameId;
         } else {
             dupCount++;
         }
@@ -1585,14 +1649,18 @@ int main(int argc, char** argv) {
         double statElapsed = (double)(now.QuadPart - lastStat.QuadPart) / freq.QuadPart;
         if (statElapsed >= 1.0) {
             int capCount = g.captureCount.exchange(0, std::memory_order_relaxed);
-            int dropCount = capCount > outCount ? capCount - outCount : 0;
+            int dropCount = capCount > uniqCount ? capCount - uniqCount : 0;
 
-            // Calculate average frame skip
-            float avgSkip = g.frameSkipCount > 0 ? (float)g.frameSkipTotal / g.frameSkipCount : 0;
-
-            printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d Skip:%d-%d(%.1f)   ",
-                   outCount, capCount, uniqCount, dupCount, dropCount,
-                   g.frameSkipMin == INT_MAX ? 0 : g.frameSkipMin, g.frameSkipMax, avgSkip);
+            if (g.useSmartFrameSelection && g.frameSkipCount > 0) {
+                // Show frame skip stats for smart-select mode
+                float avgSkip = (float)g.frameSkipTotal / g.frameSkipCount;
+                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d Skip:%d-%d(%.1f)   ",
+                       outCount, capCount, uniqCount, dupCount, dropCount,
+                       g.frameSkipMin == INT_MAX ? 0 : g.frameSkipMin, g.frameSkipMax, avgSkip);
+            } else {
+                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d   ",
+                       outCount, capCount, uniqCount, dupCount, dropCount);
+            }
             fflush(stdout);
 
             // Reset stats
