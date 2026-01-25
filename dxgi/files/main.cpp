@@ -395,6 +395,7 @@ struct {
     bool useFrameDelay = true;  // Add small delay after waitable for consistent frame selection
     int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
     ScaleFilter scaleFilter = SCALE_BILINEAR;  // Scaling filter (default: bilinear, lanczos has issues)
+    int userTargetFps = -1;  // User-specified output FPS (-1 = auto-detect, 0 = no VSync)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -1358,6 +1359,8 @@ void PrintUsage(const char* prog) {
     printf("  --scale FILTER   Scaling filter: point, bilinear, bicubic, lanczos (default: lanczos)\n");
     printf("                   lanczos = highest quality, best for 4K->1080p downscaling\n");
     printf("  --no-cursor      Hide the mouse cursor\n");
+    printf("  --out N          Target output FPS (default: auto-detect from monitor)\n");
+    printf("                   Use 0 for no VSync (run as fast as possible)\n");
     printf("  --no-waitable    Disable waitable swap chain (frame pacing)\n");
     printf("  --no-smart-select Disable smart frame selection (use fixed delay)\n");
     printf("  --no-frame-delay Disable frame delay (frame pacing fallback)\n");
@@ -1379,6 +1382,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
         else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-cursor")) g.showCursor = false;
+        else if (!strcmp(argv[i], "--out") && i+1 < argc) g.userTargetFps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i+1 < argc) {
             i++;
             if (!strcmp(argv[i], "point")) g.scaleFilter = SCALE_POINT;
@@ -1436,22 +1440,36 @@ int main(int argc, char** argv) {
             output->Release();
         }
 
+        // Override with user-specified FPS if provided
+        if (g.userTargetFps >= 0) {
+            float detectedRate = g.targetRefreshRate;
+            g.targetRefreshRate = (float)g.userTargetFps;
+            printf("  Target: %dHz (user override, detected: %.2fHz)\n", g.userTargetFps, detectedRate);
+        } else {
+            printf("  Target: %.2fHz (auto-detected)\n", g.targetRefreshRate);
+        }
+
         // Calculate target frame skip for smart frame selection
         // e.g., 120Hz source / 60Hz target = 2 (show every 2nd frame)
         if (g.sourceRefreshRate > 0 && g.targetRefreshRate > 0) {
             g.targetFrameSkip = (int)round(g.sourceRefreshRate / g.targetRefreshRate);
             if (g.targetFrameSkip < 1) g.targetFrameSkip = 1;
+            printf("  Frame skip: %d (source %.0fHz / target %.0fHz)\n",
+                   g.targetFrameSkip, g.sourceRefreshRate, g.targetRefreshRate);
+        } else if (g.userTargetFps == 0) {
+            g.targetFrameSkip = 1;
+            printf("  Frame skip: 1 (no VSync, unlimited)\n");
         }
 
-        printf("  Target: %.2fHz (frame skip: %d)\n", g.targetRefreshRate, g.targetFrameSkip);
-
         // Print frame pacing strategy
-        if (g.targetFrameSkip > 1 && g.useSmartFrameSelection) {
+        if (g.userTargetFps == 0) {
+            printf("  Frame pacing: None (no VSync, run as fast as possible)\n");
+        } else if (g.targetFrameSkip > 1 && g.useSmartFrameSelection) {
             printf("  Frame pacing: Smart selection (wait for frame N+%d)\n", g.targetFrameSkip);
         } else if (g.useFrameDelay && g.frameDelayUs > 0) {
-            printf("  Frame pacing: Fixed delay (%d µs)\n", g.frameDelayUs);
+            printf("  Frame pacing: Fixed delay (%d us)\n", g.frameDelayUs);
         } else {
-            printf("  Frame pacing: None (immediate)\n");
+            printf("  Frame pacing: VSync only\n");
         }
 
         // Print scaling filter
@@ -1497,37 +1515,42 @@ int main(int argc, char** argv) {
     int outCount = 0, uniqCount = 0, dupCount = 0;
 
     MSG msg;
+    bool noVSync = (g.userTargetFps == 0);
+
     while (g.running) {
-        // Wait for VSync timing signal (if waitable swap chain is available)
-        // This ensures we acquire the freshest frame right after VSync
-        if (g.frameLatencyWaitable) {
-            WaitForSingleObjectEx(g.frameLatencyWaitable, 100, TRUE);
-        }
+        // Skip all frame pacing when running without VSync (--out 0)
+        if (!noVSync) {
+            // Wait for VSync timing signal (if waitable swap chain is available)
+            // This ensures we acquire the freshest frame right after VSync
+            if (g.frameLatencyWaitable) {
+                WaitForSingleObjectEx(g.frameLatencyWaitable, 100, TRUE);
+            }
 
-        // Smart frame selection: only wait for next frame if desktop is active
-        // This ensures consistent Skip:2-2 for 120Hz→60Hz while maintaining
-        // 60 FPS output when desktop is idle (showing duplicate frames)
-        if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
-            UINT64 currentCapture = g.captureFrameId.load(std::memory_order_relaxed);
+            // Smart frame selection: only wait for next frame if desktop is active
+            // This ensures consistent Skip:2-2 for 120Hz→60Hz while maintaining
+            // 60 FPS output when desktop is idle (showing duplicate frames)
+            if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
+                UINT64 currentCapture = g.captureFrameId.load(std::memory_order_relaxed);
 
-            // Check if new frames are coming in (desktop is active)
-            if (currentCapture > g.lastCaptureCheckId) {
-                // Desktop is active - wait for the right frame
-                UINT64 targetId = g.lastRenderedId + g.targetFrameSkip;
+                // Check if new frames are coming in (desktop is active)
+                if (currentCapture > g.lastCaptureCheckId) {
+                    // Desktop is active - wait for the right frame
+                    UINT64 targetId = g.lastRenderedId + g.targetFrameSkip;
 
-                // Only wait if we haven't reached target yet
-                if (currentCapture < targetId) {
-                    // Use frame delay to wait for the next frame
-                    if (g.useFrameDelay && g.frameDelayUs > 0) {
-                        DelayMicroseconds(g.frameDelayUs);
+                    // Only wait if we haven't reached target yet
+                    if (currentCapture < targetId) {
+                        // Use frame delay to wait for the next frame
+                        if (g.useFrameDelay && g.frameDelayUs > 0) {
+                            DelayMicroseconds(g.frameDelayUs);
+                        }
                     }
                 }
+                // Update check ID for next iteration
+                g.lastCaptureCheckId = currentCapture;
+            } else if (g.useFrameDelay && g.frameDelayUs > 0) {
+                // Fallback: simple fixed delay
+                DelayMicroseconds(g.frameDelayUs);
             }
-            // Update check ID for next iteration
-            g.lastCaptureCheckId = currentCapture;
-        } else if (g.useFrameDelay && g.frameDelayUs > 0) {
-            // Fallback: simple fixed delay
-            DelayMicroseconds(g.frameDelayUs);
         }
 
         while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
@@ -1537,7 +1560,8 @@ int main(int argc, char** argv) {
         if (!g.running) break;
 
         Render();
-        g.swapChain->Present(1, 0);
+        // Present: sync interval 1 = VSync, 0 = no VSync (run as fast as possible)
+        g.swapChain->Present(g.userTargetFps == 0 ? 0 : 1, 0);
 
         outCount++;
 
