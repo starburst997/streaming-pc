@@ -68,7 +68,7 @@ dxgi-mirror.exe [options]
   --stretch        Stretch to fill (ignore aspect ratio)
   --no-tonemap     Disable HDR to SDR tonemapping
   --sdr-white N    SDR white level in nits (default: 240)
-  --scale FILTER   Scaling filter for resolution changes (default: lanczos)
+  --scale FILTER   Scaling filter for resolution changes (default: bilinear)
                    point    - Nearest neighbor (fastest, blocky)
                    bilinear - Linear interpolation (smooth but soft)
                    bicubic  - Catmull-Rom (good quality, fast)

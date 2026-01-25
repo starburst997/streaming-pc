@@ -129,14 +129,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return float4(color.rgb, 1.0);
 })";
 
-// Cursor pixel shader - handles alpha blending and masked cursors
+// Cursor pixel shader - handles alpha blending
 const char* g_PixelShaderCursor = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float4 color = tex.Sample(samp, uv);
-    return color;  // Alpha blending handled by blend state
+    if (color.a < 0.004) discard;
+    return color;
 })";
 
 // Lanczos scaling shader - highest quality downscaling
@@ -393,7 +394,7 @@ struct {
     bool useWaitableSwapChain = true;  // Use waitable swap chain for frame pacing
     bool useFrameDelay = true;  // Add small delay after waitable for consistent frame selection
     int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
-    ScaleFilter scaleFilter = SCALE_LANCZOS;  // Scaling filter (default: highest quality)
+    ScaleFilter scaleFilter = SCALE_BILINEAR;  // Scaling filter (default: bilinear, lanczos has issues)
     bool debug = false;   // Debug output
     std::atomic<bool> running{true};
 
@@ -1170,46 +1171,46 @@ void Render() {
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
                 // Color cursor: BGRA format, already premultiplied alpha from Windows
-                // Just copy the data directly - it's ready for premultiplied blending
+                // Debug: analyze pixel values
+                // Color cursor: BGRA format, copy as-is (already premultiplied)
                 for (UINT y = 0; y < height; y++) {
                     for (UINT x = 0; x < width; x++) {
                         BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
-                        // BGRA format: copy as-is (already premultiplied)
                         pixels[y * width + x] = *(UINT*)src;
                     }
                 }
             } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
-                // Masked color cursor format:
-                // - Alpha = 0x00: XOR pixel (invert background) - approximate as inverted color
-                // - Alpha = 0xFF: Replace pixel with RGB color (solid cursor pixel)
-                // Output in premultiplied alpha format
+                // Masked color cursor format (per Microsoft DXGI docs):
+                // - Alpha = 0x00: DRAW this pixel with RGB color (solid)
+                // - Alpha = 0xFF: XOR with screen (if RGB=black, effectively transparent)
                 for (UINT y = 0; y < height; y++) {
                     for (UINT x = 0; x < width; x++) {
                         BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
                         BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
 
-                        if (a == 0xFF) {
-                            // Solid pixel - fully opaque (premul: RGB as-is, A=255)
+                        if (a == 0x00) {
+                            // MASKED_COLOR: a=0 means DRAW this pixel (solid, opaque)
                             pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
-                        } else if (a == 0) {
-                            // XOR pixel - approximate by showing the color with high visibility
-                            // Use ~75% opacity for XOR approximation
-                            // Premul: RGB * 0.75, A = 192
-                            BYTE pr = (BYTE)(r * 192 / 255);
-                            BYTE pg = (BYTE)(gc * 192 / 255);
-                            BYTE pb = (BYTE)(b * 192 / 255);
-                            // If color is black, use white instead (for visibility on dark backgrounds)
+                        } else if (a == 0xFF) {
+                            // MASKED_COLOR: a=0xFF means XOR with screen
+                            // XOR with black (RGB=0) = no change = transparent
+                            // XOR with white/color = show that color (visible on most backgrounds)
                             if (r == 0 && gc == 0 && b == 0) {
-                                pixels[y * width + x] = 0xC0C0C0C0;  // Semi-transparent white
+                                // XOR black = transparent
+                                pixels[y * width + x] = 0x00000000;
                             } else {
-                                pixels[y * width + x] = (192 << 24) | (pr << 16) | (pg << 8) | pb;
+                                // XOR color - show the color directly (premultiplied, fully opaque)
+                                // This makes white I-beam cursors visible
+                                pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
                             }
                         } else {
-                            // Partial alpha - treat as premultiplied
-                            BYTE pr = (BYTE)(r * a / 255);
-                            BYTE pg = (BYTE)(gc * a / 255);
-                            BYTE pb = (BYTE)(b * a / 255);
-                            pixels[y * width + x] = (a << 24) | (pr << 16) | (pg << 8) | pb;
+                            // Partial alpha - treat as blend factor
+                            // a closer to 0 = more solid, a closer to 255 = more XOR
+                            BYTE opacity = (BYTE)(255 - a);  // Invert: 0->255, 255->0
+                            BYTE pr = (BYTE)(r * opacity / 255);
+                            BYTE pg = (BYTE)(gc * opacity / 255);
+                            BYTE pb = (BYTE)(b * opacity / 255);
+                            pixels[y * width + x] = (opacity << 24) | (pr << 16) | (pg << 8) | pb;
                         }
                     }
                 }
@@ -1281,12 +1282,14 @@ void Render() {
             // Draw cursor
             g.context->PSSetShader(g.psCursor, 0, 0);
             g.context->PSSetShaderResources(0, 1, &g.cursorSrv);
+            g.context->PSSetSamplers(0, 1, &g.sampler);  // Bilinear sampling for smooth cursor scaling
             UINT stride = sizeof(Vertex), offset = 0;
             g.context->IASetVertexBuffers(0, 1, &g.cursorVb, &stride, &offset);
             g.context->Draw(4, 0);
 
-            // Disable blending
+            // Disable blending and restore linear sampler
             g.context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFF);
+            g.context->PSSetSamplers(0, 1, &g.sampler);
         }
     }
 
