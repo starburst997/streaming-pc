@@ -451,6 +451,7 @@ struct {
 
     // Stats
     std::atomic<int> captureCount{0};
+    std::atomic<int> droppedByDwm{0};  // Frames dropped by DWM (AccumulatedFrames > 1)
     std::atomic<UINT64> captureFrameId{0};
     UINT64 lastRenderedId = 0;
     UINT64 lastCaptureCheckId = 0;  // For detecting idle desktop
@@ -461,7 +462,6 @@ struct {
     int targetFrameSkip = 0;  // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
     bool useSmartFrameSelection = false;  // Disabled by default - just show latest frame
     bool waitForNewFrame = true;  // Wait for unique frame before rendering (reduces dups)
-    int waitForFrameTimeoutMs = 14;  // Max time to wait for new frame (ms), leave headroom for render
 
     // Track actually rendered frame (set by Render, read by main loop)
     UINT64 lastAcquiredFrameId = 0;
@@ -975,6 +975,11 @@ void CaptureThreadFunc() {
         bool hasNewContent = (info.LastPresentTime.QuadPart != 0) ||
                              (info.AccumulatedFrames > 0) ||
                              !buffersOpened;  // Always process first frame
+
+        // Track frames dropped by DWM (we missed frames between acquires)
+        if (info.AccumulatedFrames > 1) {
+            g.droppedByDwm.fetch_add(info.AccumulatedFrames - 1, std::memory_order_relaxed);
+        }
 
         if (hasNewContent) {
             ID3D11Texture2D* tex;
@@ -1495,7 +1500,7 @@ int main(int argc, char** argv) {
         } else if (g.useFrameDelay && g.frameDelayUs > 0) {
             printf("  Frame pacing: Fixed delay (%d us)\n", g.frameDelayUs);
         } else if (g.waitForNewFrame) {
-            printf("  Frame pacing: Wait for new frame (up to %dms timeout)\n", g.waitForFrameTimeoutMs);
+            printf("  Frame pacing: Wait for new frame (poll every 1ms, aggressive in last 1ms)\n");
         } else {
             printf("  Frame pacing: VSync only (may show dups)\n");
         }
@@ -1589,35 +1594,46 @@ int main(int argc, char** argv) {
 
         // Wait for a new frame if we would otherwise show a duplicate
         // This significantly reduces dups when capture is faster than display
+        //
+        // Strategy: Check every 1ms for a new frame. In the last 1ms before
+        // we must render, check more aggressively (every 100µs).
+        // Deadline = frame time minus 2ms headroom for render + present.
         if (g.waitForNewFrame && g.bufferInitialized.load(std::memory_order_acquire)) {
             LARGE_INTEGER waitStart, waitNow;
             QueryPerformanceCounter(&waitStart);
-            LONGLONG timeoutTicks = (LONGLONG)g.waitForFrameTimeoutMs * freq.QuadPart / 1000;
 
-            // Check if the ready frame is different from last rendered
+            // Calculate deadline: how long we can wait before we must render
+            // Frame time minus headroom for rendering
+            float frameTimeUs = 1000000.0f / g.targetRefreshRate;
+            float headroomUs = 2000.0f;  // 2ms headroom for render + present
+            float deadlineUs = frameTimeUs - headroomUs;
+            if (deadlineUs < 1000.0f) deadlineUs = 1000.0f;  // At least 1ms
+
+            LONGLONG deadlineTicks = (LONGLONG)(deadlineUs * freq.QuadPart / 1000000.0);
+
+            // Check if a new frame is available
             UINT64 readyId = g.buffer.GetReadyFrameId();
             while (readyId == g.lastRenderedId || readyId == 0) {
                 QueryPerformanceCounter(&waitNow);
                 LONGLONG elapsed = waitNow.QuadPart - waitStart.QuadPart;
 
-                if (elapsed >= timeoutTicks) {
-                    // Timeout - render whatever we have
+                if (elapsed >= deadlineTicks) {
+                    // Deadline reached - must render now
                     break;
                 }
 
-                // Calculate remaining time in ms
-                int remainingMs = (int)((timeoutTicks - elapsed) * 1000 / freq.QuadPart);
+                // Calculate time remaining until deadline (in µs)
+                int remainingUs = (int)((deadlineTicks - elapsed) * 1000000 / freq.QuadPart);
 
-                if (remainingMs > 2) {
-                    // More than 2ms left - use Sleep(1) to be CPU-friendly
-                    Sleep(1);
-                } else if (remainingMs > 0) {
-                    // Less than 2ms - use Sleep(0) for faster response
-                    Sleep(0);
+                if (remainingUs > 1000) {
+                    // More than 1ms until deadline - check every 1ms
+                    DelayMicroseconds(1000);
+                } else {
+                    // Last 1ms - check aggressively every 100µs
+                    DelayMicroseconds(100);
                 }
-                // In the last moments, spin-wait (no sleep)
 
-                // Check again
+                // Check for new frame
                 readyId = g.buffer.GetReadyFrameId();
             }
         }
@@ -1649,17 +1665,18 @@ int main(int argc, char** argv) {
         double statElapsed = (double)(now.QuadPart - lastStat.QuadPart) / freq.QuadPart;
         if (statElapsed >= 1.0) {
             int capCount = g.captureCount.exchange(0, std::memory_order_relaxed);
+            int dwmDropped = g.droppedByDwm.exchange(0, std::memory_order_relaxed);
             int dropCount = capCount > uniqCount ? capCount - uniqCount : 0;
 
             if (g.useSmartFrameSelection && g.frameSkipCount > 0) {
                 // Show frame skip stats for smart-select mode
                 float avgSkip = (float)g.frameSkipTotal / g.frameSkipCount;
-                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d Skip:%d-%d(%.1f)   ",
-                       outCount, capCount, uniqCount, dupCount, dropCount,
+                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d DwmDrop:%3d Skip:%d-%d(%.1f)   ",
+                       outCount, capCount, uniqCount, dupCount, dropCount, dwmDropped,
                        g.frameSkipMin == INT_MAX ? 0 : g.frameSkipMin, g.frameSkipMax, avgSkip);
             } else {
-                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d   ",
-                       outCount, capCount, uniqCount, dupCount, dropCount);
+                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d DwmDrop:%3d   ",
+                       outCount, capCount, uniqCount, dupCount, dropCount, dwmDropped);
             }
             fflush(stdout);
 
