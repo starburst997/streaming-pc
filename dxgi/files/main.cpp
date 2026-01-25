@@ -20,6 +20,7 @@
 #include <climits>
 #include <thread>
 #include <atomic>
+#include <intrin.h> // For _mm_pause()
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -28,14 +29,14 @@
 #pragma comment(lib, "winmm.lib")
 
 // Simple vertex shader - same for SDR and HDR
-const char* g_VertexShader = R"(
+const char *g_VertexShader = R"(
 struct VS_OUTPUT { float4 pos : SV_POSITION; float2 tex : TEXCOORD0; };
 VS_OUTPUT main(float2 pos : POSITION, float2 tex : TEXCOORD0) {
     VS_OUTPUT o; o.pos = float4(pos, 0, 1); o.tex = tex; return o;
 })";
 
 // SDR pixel shader - simple passthrough
-const char* g_PixelShaderSDR = R"(
+const char *g_PixelShaderSDR = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
@@ -44,7 +45,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
 // SDR pixel shader with gamma correction
 // Used when source monitor is HDR but gives us B8G8R8A8 (linear values in SDR container)
-const char* g_PixelShaderSDRGamma = R"(
+const char *g_PixelShaderSDRGamma = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
@@ -70,7 +71,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 // References:
 // - https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
 // - https://github.com/obsproject/obs-studio/blob/master/libobs/data/color.effect
-const char* g_PixelShaderHDR = R"(
+const char *g_PixelShaderHDR = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
@@ -130,7 +131,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 })";
 
 // Cursor pixel shader - handles alpha blending
-const char* g_PixelShaderCursor = R"(
+const char *g_PixelShaderCursor = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
@@ -143,7 +144,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 // Lanczos scaling shader - highest quality downscaling
 // Uses Lanczos3 kernel (3 lobes) for sharp, artifact-free results
 // Includes optional HDR tonemapping
-const char* g_PixelShaderLanczos = R"(
+const char *g_PixelShaderLanczos = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
@@ -218,7 +219,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 // Bicubic scaling shader - good quality, faster than Lanczos
 // Uses Catmull-Rom spline (sharper than Mitchell-Netravali)
 // Includes optional HDR tonemapping
-const char* g_PixelShaderBicubic = R"(
+const char *g_PixelShaderBicubic = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 
@@ -298,20 +299,25 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 })";
 
 // Scaling filter types
-enum ScaleFilter {
-    SCALE_POINT = 0,     // Nearest neighbor - fastest, blocky
-    SCALE_BILINEAR,      // Linear interpolation - smooth but soft
-    SCALE_BICUBIC,       // Catmull-Rom cubic - good balance
-    SCALE_LANCZOS        // Lanczos3 - highest quality (default)
+enum ScaleFilter
+{
+    SCALE_POINT = 0, // Nearest neighbor - fastest, blocky
+    SCALE_BILINEAR,  // Linear interpolation - smooth but soft
+    SCALE_BICUBIC,   // Catmull-Rom cubic - good balance
+    SCALE_LANCZOS    // Lanczos3 - highest quality (default)
 };
 
-struct Vertex { float x, y, u, v; };
-Vertex g_Quad[] = {{-1,1,0,0}, {1,1,1,0}, {-1,-1,0,1}, {1,-1,1,1}};
+struct Vertex
+{
+    float x, y, u, v;
+};
+Vertex g_Quad[] = {{-1, 1, 0, 0}, {1, 1, 1, 0}, {-1, -1, 0, 1}, {1, -1, 1, 1}};
 
 // Triple buffer for lock-free producer/consumer with frame ID tracking
-struct TripleBuffer {
-    ID3D11Texture2D* textures[3] = {nullptr, nullptr, nullptr};
-    ID3D11ShaderResourceView* srvs[3] = {nullptr, nullptr, nullptr};
+struct TripleBuffer
+{
+    ID3D11Texture2D *textures[3] = {nullptr, nullptr, nullptr};
+    ID3D11ShaderResourceView *srvs[3] = {nullptr, nullptr, nullptr};
 
     // Frame IDs for each buffer slot (for consistent frame selection)
     std::atomic<UINT64> frameIds[3] = {{0}, {0}, {0}};
@@ -323,52 +329,75 @@ struct TripleBuffer {
     // Last displayed frame ID (for consistent frame skipping)
     UINT64 lastDisplayedFrameId = 0;
 
-    void PublishFrame(UINT64 frameId) {
-        int completed = writeIdx.load(std::memory_order_relaxed);
-        frameIds[completed].store(frameId, std::memory_order_relaxed);
+    void PublishFrame(UINT64 frameId)
+    {
+        int completed = writeIdx.load(std::memory_order_acquire);
+        // Store frameId with release semantics to ensure GPU copy is visible
+        frameIds[completed].store(frameId, std::memory_order_release);
+        // Full memory barrier before publishing to ensure texture data is visible
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         int oldReady = readyIdx.exchange(completed, std::memory_order_acq_rel);
 
-        if (oldReady >= 0 && oldReady != displayIdx.load(std::memory_order_acquire)) {
-            writeIdx.store(oldReady, std::memory_order_relaxed);
-        } else {
+        if (oldReady >= 0 && oldReady != displayIdx.load(std::memory_order_acquire))
+        {
+            // Reclaim the previous ready buffer for writing
+            writeIdx.store(oldReady, std::memory_order_release);
+        }
+        else
+        {
+            // Find any free buffer (not ready, not displaying)
             int disp = displayIdx.load(std::memory_order_acquire);
             int ready = readyIdx.load(std::memory_order_acquire);
-            for (int i = 0; i < 3; i++) {
-                if (i != ready && i != disp) {
-                    writeIdx.store(i, std::memory_order_relaxed);
+            for (int i = 0; i < 3; i++)
+            {
+                if (i != ready && i != disp)
+                {
+                    writeIdx.store(i, std::memory_order_release);
                     break;
                 }
             }
         }
     }
 
-    int AcquireFrame(UINT64* outFrameId = nullptr) {
+    int AcquireFrame(UINT64 *outFrameId = nullptr, int *outBufIdx = nullptr)
+    {
         int ready = readyIdx.exchange(-1, std::memory_order_acq_rel);
-        if (ready >= 0) {
+        if (ready >= 0)
+        {
             displayIdx.store(ready, std::memory_order_release);
         }
         int idx = displayIdx.load(std::memory_order_acquire);
-        if (idx >= 0 && outFrameId) {
-            *outFrameId = frameIds[idx].load(std::memory_order_relaxed);
+        if (idx >= 0 && outFrameId)
+        {
+            // Use acquire to synchronize with the release store in PublishFrame
+            *outFrameId = frameIds[idx].load(std::memory_order_acquire);
+        }
+        if (outBufIdx)
+        {
+            *outBufIdx = idx;
         }
         return idx;
     }
 
     int GetWriteIndex() { return writeIdx.load(std::memory_order_relaxed); }
 
-    UINT64 GetReadyFrameId() {
+    UINT64 GetReadyFrameId()
+    {
         int ready = readyIdx.load(std::memory_order_acquire);
-        if (ready >= 0) {
-            return frameIds[ready].load(std::memory_order_relaxed);
+        if (ready >= 0)
+        {
+            // Use acquire to synchronize with the release store in PublishFrame
+            return frameIds[ready].load(std::memory_order_acquire);
         }
         return 0;
     }
 };
 
 // Cursor info shared between capture and render threads
-struct CursorInfo {
+struct CursorInfo
+{
     std::atomic<bool> visible{true};   // Default to visible (will be updated on first cursor event)
-    std::atomic<bool> hasShape{false};  // True once we've captured a cursor shape
+    std::atomic<bool> hasShape{false}; // True once we've captured a cursor shape
     std::atomic<int> x{0};
     std::atomic<int> y{0};
     std::atomic<int> width{0};
@@ -376,7 +405,7 @@ struct CursorInfo {
     std::atomic<bool> shapeUpdated{false};
 
     // Shape data (protected by shapeUpdated flag)
-    BYTE* shapeBuffer = nullptr;
+    BYTE *shapeBuffer = nullptr;
     UINT shapeBufferSize = 0;
     UINT shapeWidth = 0;
     UINT shapeHeight = 0;
@@ -384,55 +413,56 @@ struct CursorInfo {
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE shapeType = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
 };
 
-struct {
+struct
+{
     int sourceMonitor = 0;
     int targetMonitor = 1;
     bool preserveAspect = true;
-    bool tonemap = true;  // HDR to SDR tonemapping (can be disabled with --no-tonemap)
-    float sdrWhiteNits = 240.0f;  // SDR white level in nits (matches OBS default)
-    bool showCursor = true;  // Show cursor (can be disabled with --no-cursor)
-    bool useWaitableSwapChain = true;  // Use waitable swap chain for lower latency
-    bool useFrameDelay = false;  // Add small delay after waitable (disabled by default)
-    int frameDelayUs = 1000;  // Frame delay in microseconds (default 1000µs = 1ms)
-    ScaleFilter scaleFilter = SCALE_BICUBIC;  // Scaling filter (default: bicubic)
-    int userTargetFps = -1;  // User-specified output FPS (-1 = auto-detect, 0 = no VSync)
-    bool debug = false;   // Debug output
+    bool tonemap = true;                     // HDR to SDR tonemapping (can be disabled with --no-tonemap)
+    float sdrWhiteNits = 240.0f;             // SDR white level in nits (matches OBS default)
+    bool showCursor = true;                  // Show cursor (can be disabled with --no-cursor)
+    bool useWaitableSwapChain = true;        // Use waitable swap chain for lower latency
+    bool useFrameDelay = false;              // Add small delay after waitable (disabled by default)
+    int frameDelayUs = 1000;                 // Frame delay in microseconds (default 1000µs = 1ms)
+    ScaleFilter scaleFilter = SCALE_BICUBIC; // Scaling filter (default: bicubic)
+    int userTargetFps = -1;                  // User-specified output FPS (-1 = auto-detect, 0 = no VSync)
+    bool debug = false;                      // Debug output
     std::atomic<bool> running{true};
 
     HWND hwnd = nullptr;
     int windowWidth = 0, windowHeight = 0;
 
     // Render thread resources
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    IDXGISwapChain1* swapChain = nullptr;
-    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11Device *device = nullptr;
+    ID3D11DeviceContext *context = nullptr;
+    IDXGISwapChain1 *swapChain = nullptr;
+    ID3D11RenderTargetView *rtv = nullptr;
 
-    ID3D11VertexShader* vs = nullptr;
-    ID3D11PixelShader* psSDR = nullptr;
-    ID3D11PixelShader* psSDRGamma = nullptr;  // For HDR monitor giving SDR format
-    ID3D11PixelShader* psHDR = nullptr;
-    ID3D11PixelShader* psLanczos = nullptr;   // Lanczos scaling shader
-    ID3D11PixelShader* psBicubic = nullptr;   // Bicubic scaling shader
-    ID3D11InputLayout* layout = nullptr;
-    ID3D11Buffer* vb = nullptr;
-    ID3D11Buffer* cbHDR = nullptr;  // Constant buffer for HDR shader
-    ID3D11Buffer* cbScale = nullptr;  // Constant buffer for scale shaders
-    ID3D11SamplerState* sampler = nullptr;  // Linear sampler (bilinear)
-    ID3D11SamplerState* samplerPoint = nullptr;  // Point sampler (nearest neighbor)
+    ID3D11VertexShader *vs = nullptr;
+    ID3D11PixelShader *psSDR = nullptr;
+    ID3D11PixelShader *psSDRGamma = nullptr; // For HDR monitor giving SDR format
+    ID3D11PixelShader *psHDR = nullptr;
+    ID3D11PixelShader *psLanczos = nullptr; // Lanczos scaling shader
+    ID3D11PixelShader *psBicubic = nullptr; // Bicubic scaling shader
+    ID3D11InputLayout *layout = nullptr;
+    ID3D11Buffer *vb = nullptr;
+    ID3D11Buffer *cbHDR = nullptr;              // Constant buffer for HDR shader
+    ID3D11Buffer *cbScale = nullptr;            // Constant buffer for scale shaders
+    ID3D11SamplerState *sampler = nullptr;      // Linear sampler (bilinear)
+    ID3D11SamplerState *samplerPoint = nullptr; // Point sampler (nearest neighbor)
 
     // Cursor resources
-    ID3D11PixelShader* psCursor = nullptr;
-    ID3D11Texture2D* cursorTex = nullptr;
-    ID3D11ShaderResourceView* cursorSrv = nullptr;
-    ID3D11Buffer* cursorVb = nullptr;
-    ID3D11BlendState* blendState = nullptr;
+    ID3D11PixelShader *psCursor = nullptr;
+    ID3D11Texture2D *cursorTex = nullptr;
+    ID3D11ShaderResourceView *cursorSrv = nullptr;
+    ID3D11Buffer *cursorVb = nullptr;
+    ID3D11BlendState *blendState = nullptr;
     CursorInfo cursor;
 
     // Capture thread resources
-    ID3D11Device* capDevice = nullptr;
-    ID3D11DeviceContext* capContext = nullptr;
-    IDXGIOutputDuplication* duplication = nullptr;
+    ID3D11Device *capDevice = nullptr;
+    ID3D11DeviceContext *capContext = nullptr;
+    IDXGIOutputDuplication *duplication = nullptr;
 
     TripleBuffer buffer;
 
@@ -440,8 +470,8 @@ struct {
     D3D11_VIEWPORT viewport = {};
 
     // Source format info (detected from first captured frame)
-    bool sourceIsHDR = false;           // True if actual captured format is HDR (R16G16B16A16_FLOAT)
-    bool sourceReportedHDR = false;     // True if monitor reported HDR capability
+    bool sourceIsHDR = false;       // True if actual captured format is HDR (R16G16B16A16_FLOAT)
+    bool sourceReportedHDR = false; // True if monitor reported HDR capability
     DXGI_FORMAT sourceFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     std::atomic<bool> bufferInitialized{false};
 
@@ -451,20 +481,28 @@ struct {
 
     // Stats
     std::atomic<int> captureCount{0};
-    std::atomic<int> droppedByDwm{0};  // Frames dropped by DWM (AccumulatedFrames > 1)
+    std::atomic<int> droppedByDwm{0}; // Frames dropped by DWM (AccumulatedFrames > 1)
     std::atomic<UINT64> captureFrameId{0};
+    std::atomic<int> frameWentBackward{0}; // Counter for detecting out-of-order frames
+
+    // Capture timing stats (in microseconds, for debugging)
+    std::atomic<int> capTimeAcquire{0}; // Time spent waiting in AcquireNextFrame
+    std::atomic<int> capTimeCopy{0};    // Time spent on copy + flush
+    std::atomic<int> capTimeRelease{0}; // Time spent on ReleaseFrame
+    std::atomic<int> capLoopCount{0};   // Total loop iterations (including cursor-only)
     UINT64 lastRenderedId = 0;
-    UINT64 lastCaptureCheckId = 0;  // For detecting idle desktop
+    UINT64 lastCaptureCheckId = 0; // For detecting idle desktop
 
     // Frame pacing stats
     // Frame pacing
     HANDLE frameLatencyWaitable = nullptr;
-    int targetFrameSkip = 0;  // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
-    bool useSmartFrameSelection = false;  // Disabled by default - just show latest frame
-    bool waitForNewFrame = true;  // Wait for unique frame before rendering (reduces dups)
+    int targetFrameSkip = 0;             // Auto-detected: sourceHz / targetHz (e.g., 2 for 120→60)
+    bool useSmartFrameSelection = false; // Disabled by default - just show latest frame
+    bool waitForNewFrame = true;         // Wait for unique frame before rendering (reduces dups)
 
     // Track actually rendered frame (set by Render, read by main loop)
     UINT64 lastAcquiredFrameId = 0;
+    int lastAcquiredBufIdx = -1; // Buffer index for debugging
 
     // Frame skip stats (for smart-select mode)
     int frameSkipMin = INT_MAX;
@@ -479,8 +517,10 @@ void Cleanup();
 
 // High-precision microsecond delay using spin-wait
 // Sleep() only has ~1ms precision, this gives µs precision
-void DelayMicroseconds(int us) {
-    if (us <= 0) return;
+void DelayMicroseconds(int us)
+{
+    if (us <= 0)
+        return;
 
     LARGE_INTEGER freq, start, now;
     QueryPerformanceFrequency(&freq);
@@ -490,55 +530,66 @@ void DelayMicroseconds(int us) {
     LONGLONG endTicks = start.QuadPart + (LONGLONG)targetTicks;
 
     // Spin-wait for precise timing
-    do {
+    do
+    {
         QueryPerformanceCounter(&now);
     } while (now.QuadPart < endTicks);
 }
 
-void Fatal(const char* msg, HRESULT hr = 0) {
-    if (hr) fprintf(stderr, "FATAL: %s (0x%08X)\n", msg, (unsigned)hr);
-    else fprintf(stderr, "FATAL: %s\n", msg);
+void Fatal(const char *msg, HRESULT hr = 0)
+{
+    if (hr)
+        fprintf(stderr, "FATAL: %s (0x%08X)\n", msg, (unsigned)hr);
+    else
+        fprintf(stderr, "FATAL: %s\n", msg);
     Cleanup();
     exit(1);
 }
 
 // Console control handler for graceful CTRL+C shutdown
-BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
-    switch (ctrlType) {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-        case CTRL_LOGOFF_EVENT:
-        case CTRL_SHUTDOWN_EVENT:
-            printf("\nReceived shutdown signal...\n");
-            g.running = false;
-            // Give threads time to clean up
-            Sleep(200);
-            return TRUE;
+BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
+{
+    switch (ctrlType)
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        printf("\nReceived shutdown signal...\n");
+        g.running = false;
+        // Give threads time to clean up
+        Sleep(200);
+        return TRUE;
     }
     return FALSE;
 }
 
-struct MonitorInfo {
+struct MonitorInfo
+{
     int index;
     RECT rect;
     WCHAR deviceName[32];
     float refreshRate;
 };
 
-BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT rect, LPARAM data) {
-    auto* info = (MonitorInfo*)data;
-    if (info->index == 0) {
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT rect, LPARAM data)
+{
+    auto *info = (MonitorInfo *)data;
+    if (info->index == 0)
+    {
         info->rect = *rect;
         // Get device name for this monitor
         MONITORINFOEXW mi = {};
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(hMon, &mi)) {
+        if (GetMonitorInfoW(hMon, &mi))
+        {
             wcscpy_s(info->deviceName, mi.szDevice);
             // Get CURRENT refresh rate using EnumDisplaySettings
             DEVMODEW devMode = {};
             devMode.dmSize = sizeof(devMode);
-            if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &devMode)) {
+            if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &devMode))
+            {
                 info->refreshRate = (float)devMode.dmDisplayFrequency;
             }
         }
@@ -548,7 +599,8 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT rect, LPARAM data) {
     return TRUE;
 }
 
-bool GetMonitorRect(int idx, RECT* rect) {
+bool GetMonitorRect(int idx, RECT *rect)
+{
     MonitorInfo info = {idx, {}, L"", 0};
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
     *rect = info.rect;
@@ -556,7 +608,8 @@ bool GetMonitorRect(int idx, RECT* rect) {
 }
 
 // Get the actual current refresh rate for a monitor (not the max supported)
-float GetMonitorRefreshRate(int idx) {
+float GetMonitorRefreshRate(int idx)
+{
     MonitorInfo info = {idx, {}, L"", 60.0f};
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
     return info.refreshRate;
@@ -564,9 +617,11 @@ float GetMonitorRefreshRate(int idx) {
 
 int GetMonitorCount() { return GetSystemMetrics(SM_CMONITORS); }
 
-void PrintMonitors() {
+void PrintMonitors()
+{
     printf("Available monitors:\n");
-    for (int i = 0; i < GetMonitorCount(); i++) {
+    for (int i = 0; i < GetMonitorCount(); i++)
+    {
         MonitorInfo info = {i, {}, L"", 0};
         EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&info);
         printf("  %d: %dx%d at (%d,%d) @ %.0fHz\n", i,
@@ -577,119 +632,155 @@ void PrintMonitors() {
     }
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { g.running = false; return 0; }
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE)
+    {
+        g.running = false;
+        return 0;
+    }
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return 0;
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-void CreateWindow_() {
-    WNDCLASS wc = {}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
-    wc.lpszClassName = "DXGIMirror"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+void CreateWindow_()
+{
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = "DXGIMirror";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClass(&wc);
 
     g.windowWidth = g.targetRect.right - g.targetRect.left;
     g.windowHeight = g.targetRect.bottom - g.targetRect.top;
 
     g.hwnd = CreateWindowEx(WS_EX_TOPMOST, "DXGIMirror", "DXGI Mirror",
-        WS_POPUP | WS_VISIBLE, g.targetRect.left, g.targetRect.top,
-        g.windowWidth, g.windowHeight, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+                            WS_POPUP | WS_VISIBLE, g.targetRect.left, g.targetRect.top,
+                            g.windowWidth, g.windowHeight, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
 
     float srcW = (float)(g.sourceRect.right - g.sourceRect.left);
     float srcH = (float)(g.sourceRect.bottom - g.sourceRect.top);
     float dstW = (float)g.windowWidth, dstH = (float)g.windowHeight;
 
-    if (g.preserveAspect) {
+    if (g.preserveAspect)
+    {
         float srcAspect = srcW / srcH, dstAspect = dstW / dstH;
-        if (srcAspect > dstAspect) {
+        if (srcAspect > dstAspect)
+        {
             float h = dstW / srcAspect;
-            g.viewport = {0, (dstH-h)/2, dstW, h, 0, 1};
-        } else {
-            float w = dstH * srcAspect;
-            g.viewport = {(dstW-w)/2, 0, w, dstH, 0, 1};
+            g.viewport = {0, (dstH - h) / 2, dstW, h, 0, 1};
         }
-    } else {
+        else
+        {
+            float w = dstH * srcAspect;
+            g.viewport = {(dstW - w) / 2, 0, w, dstH, 0, 1};
+        }
+    }
+    else
+    {
         g.viewport = {0, 0, dstW, dstH, 0, 1};
     }
 }
 
-void InitD3D() {
+void InitD3D()
+{
     HRESULT hr;
     D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     D3D_FEATURE_LEVEL flOut;
 
     hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 2,
-        D3D11_SDK_VERSION, &g.device, &flOut, &g.context);
-    if (FAILED(hr)) Fatal("D3D11CreateDevice (render)", hr);
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 2,
+                           D3D11_SDK_VERSION, &g.device, &flOut, &g.context);
+    if (FAILED(hr))
+        Fatal("D3D11CreateDevice (render)", hr);
 
     hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 2,
-        D3D11_SDK_VERSION, &g.capDevice, &flOut, &g.capContext);
-    if (FAILED(hr)) Fatal("D3D11CreateDevice (capture)", hr);
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 2,
+                           D3D11_SDK_VERSION, &g.capDevice, &flOut, &g.capContext);
+    if (FAILED(hr))
+        Fatal("D3D11CreateDevice (capture)", hr);
 
-    IDXGIDevice* dxgiDev; g.device->QueryInterface(&dxgiDev);
-    IDXGIAdapter* adapter; dxgiDev->GetAdapter(&adapter); dxgiDev->Release();
-    IDXGIFactory2* factory; adapter->GetParent(__uuidof(IDXGIFactory2), (void**)&factory);
+    IDXGIDevice *dxgiDev;
+    g.device->QueryInterface(&dxgiDev);
+    IDXGIAdapter *adapter;
+    dxgiDev->GetAdapter(&adapter);
+    dxgiDev->Release();
+    IDXGIFactory2 *factory;
+    adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&factory);
     adapter->Release();
 
     DXGI_SWAP_CHAIN_DESC1 scd = {};
-    scd.Width = g.windowWidth; scd.Height = g.windowHeight;
+    scd.Width = g.windowWidth;
+    scd.Height = g.windowHeight;
     scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    if (g.useWaitableSwapChain) {
+    if (g.useWaitableSwapChain)
+    {
         scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     }
 
     hr = factory->CreateSwapChainForHwnd(g.device, g.hwnd, &scd, nullptr, nullptr, &g.swapChain);
     factory->Release();
-    if (FAILED(hr)) Fatal("CreateSwapChain", hr);
+    if (FAILED(hr))
+        Fatal("CreateSwapChain", hr);
 
     // Set max frame latency to 1 for tighter timing control
-    if (g.useWaitableSwapChain) {
-        IDXGISwapChain2* swapChain2 = nullptr;
+    if (g.useWaitableSwapChain)
+    {
+        IDXGISwapChain2 *swapChain2 = nullptr;
         hr = g.swapChain->QueryInterface(&swapChain2);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr))
+        {
             swapChain2->SetMaximumFrameLatency(1);
             g.frameLatencyWaitable = swapChain2->GetFrameLatencyWaitableObject();
             swapChain2->Release();
         }
     }
 
-    ID3D11Texture2D* bb;
-    g.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
+    ID3D11Texture2D *bb;
+    g.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
     g.device->CreateRenderTargetView(bb, nullptr, &g.rtv);
     bb->Release();
 }
 
-void InitShaders() {
-    HRESULT hr; ID3DBlob *blob, *err;
+void InitShaders()
+{
+    HRESULT hr;
+    ID3DBlob *blob, *err;
 
     // Vertex shader (shared)
     hr = D3DCompile(g_VertexShader, strlen(g_VertexShader), "VS", 0, 0, "main", "vs_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) Fatal("VS compile");
+    if (FAILED(hr))
+        Fatal("VS compile");
     g.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.vs);
 
     D3D11_INPUT_ELEMENT_DESC ied[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}
-    };
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}};
     g.device->CreateInputLayout(ied, 2, blob->GetBufferPointer(), blob->GetBufferSize(), &g.layout);
     blob->Release();
 
     // SDR pixel shader (passthrough)
     hr = D3DCompile(g_PixelShaderSDR, strlen(g_PixelShaderSDR), "PS_SDR", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) Fatal("PS SDR compile");
+    if (FAILED(hr))
+        Fatal("PS SDR compile");
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psSDR);
     blob->Release();
 
     // SDR pixel shader with gamma correction (for HDR monitor giving SDR format)
     hr = D3DCompile(g_PixelShaderSDRGamma, strlen(g_PixelShaderSDRGamma), "PS_SDR_Gamma", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "PS SDR Gamma compile error: %s\n", (char*)err->GetBufferPointer());
+    if (FAILED(hr))
+    {
+        if (err)
+            fprintf(stderr, "PS SDR Gamma compile error: %s\n", (char *)err->GetBufferPointer());
         Fatal("PS SDR Gamma compile");
     }
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psSDRGamma);
@@ -697,44 +788,52 @@ void InitShaders() {
 
     // HDR pixel shader (with tonemapping)
     hr = D3DCompile(g_PixelShaderHDR, strlen(g_PixelShaderHDR), "PS_HDR", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "PS HDR compile error: %s\n", (char*)err->GetBufferPointer());
+    if (FAILED(hr))
+    {
+        if (err)
+            fprintf(stderr, "PS HDR compile error: %s\n", (char *)err->GetBufferPointer());
         Fatal("PS HDR compile");
     }
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psHDR);
     blob->Release();
 
-    D3D11_BUFFER_DESC bd = {}; bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.ByteWidth = sizeof(g_Quad); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.ByteWidth = sizeof(g_Quad);
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     D3D11_SUBRESOURCE_DATA sd = {g_Quad};
     g.device->CreateBuffer(&bd, &sd, &g.vb);
 
     // Linear sampler (bilinear filtering)
-    D3D11_SAMPLER_DESC sampd = {}; sampd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    D3D11_SAMPLER_DESC sampd = {};
+    sampd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampd.AddressU = sampd.AddressV = sampd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     g.device->CreateSamplerState(&sampd, &g.sampler);
 
     // Point sampler (nearest neighbor filtering)
-    D3D11_SAMPLER_DESC sampdPoint = {}; sampdPoint.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    D3D11_SAMPLER_DESC sampdPoint = {};
+    sampdPoint.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sampdPoint.AddressU = sampdPoint.AddressV = sampdPoint.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     g.device->CreateSamplerState(&sampdPoint, &g.samplerPoint);
 
     // Constant buffer for HDR shader (sdrWhiteNits value)
     D3D11_BUFFER_DESC cbd = {};
     cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.ByteWidth = 16;  // 4 floats (16 bytes, minimum cbuffer size)
+    cbd.ByteWidth = 16; // 4 floats (16 bytes, minimum cbuffer size)
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g.device->CreateBuffer(&cbd, nullptr, &g.cbHDR);
 
     // Constant buffer for scale shaders (texSize, invTexSize, sdrWhiteNits, enableHDR)
-    cbd.ByteWidth = 32;  // 8 floats
+    cbd.ByteWidth = 32; // 8 floats
     g.device->CreateBuffer(&cbd, nullptr, &g.cbScale);
 
     // Lanczos scaling shader
     hr = D3DCompile(g_PixelShaderLanczos, strlen(g_PixelShaderLanczos), "PS_Lanczos", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "PS Lanczos compile error: %s\n", (char*)err->GetBufferPointer());
+    if (FAILED(hr))
+    {
+        if (err)
+            fprintf(stderr, "PS Lanczos compile error: %s\n", (char *)err->GetBufferPointer());
         Fatal("PS Lanczos compile");
     }
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psLanczos);
@@ -742,8 +841,10 @@ void InitShaders() {
 
     // Bicubic scaling shader
     hr = D3DCompile(g_PixelShaderBicubic, strlen(g_PixelShaderBicubic), "PS_Bicubic", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "PS Bicubic compile error: %s\n", (char*)err->GetBufferPointer());
+    if (FAILED(hr))
+    {
+        if (err)
+            fprintf(stderr, "PS Bicubic compile error: %s\n", (char *)err->GetBufferPointer());
         Fatal("PS Bicubic compile");
     }
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psBicubic);
@@ -751,7 +852,8 @@ void InitShaders() {
 
     // Cursor pixel shader
     hr = D3DCompile(g_PixelShaderCursor, strlen(g_PixelShaderCursor), "PS_Cursor", 0, 0, "main", "ps_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) Fatal("PS Cursor compile");
+    if (FAILED(hr))
+        Fatal("PS Cursor compile");
     g.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), 0, &g.psCursor);
     blob->Release();
 
@@ -760,7 +862,7 @@ void InitShaders() {
     // Blend equation: finalColor = srcColor + destColor * (1 - srcAlpha)
     D3D11_BLEND_DESC blendDesc = {};
     blendDesc.RenderTarget[0].BlendEnable = TRUE;
-    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;  // Premultiplied: use RGB as-is
+    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE; // Premultiplied: use RGB as-is
     blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
     blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
@@ -778,71 +880,96 @@ void InitShaders() {
     g.device->CreateBuffer(&cvbd, nullptr, &g.cursorVb);
 }
 
-void InitDuplication() {
+void InitDuplication()
+{
     HRESULT hr;
-    IDXGIDevice* dxgiDev; g.capDevice->QueryInterface(&dxgiDev);
-    IDXGIAdapter* adapter; dxgiDev->GetAdapter(&adapter); dxgiDev->Release();
+    IDXGIDevice *dxgiDev;
+    g.capDevice->QueryInterface(&dxgiDev);
+    IDXGIAdapter *adapter;
+    dxgiDev->GetAdapter(&adapter);
+    dxgiDev->Release();
 
-    IDXGIOutput* output = nullptr;
-    for (UINT i = 0; ; i++) {
-        IDXGIOutput* out;
-        if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
-        DXGI_OUTPUT_DESC desc; out->GetDesc(&desc);
+    IDXGIOutput *output = nullptr;
+    for (UINT i = 0;; i++)
+    {
+        IDXGIOutput *out;
+        if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND)
+            break;
+        DXGI_OUTPUT_DESC desc;
+        out->GetDesc(&desc);
         if (desc.DesktopCoordinates.left == g.sourceRect.left &&
-            desc.DesktopCoordinates.top == g.sourceRect.top) { output = out; break; }
+            desc.DesktopCoordinates.top == g.sourceRect.top)
+        {
+            output = out;
+            break;
+        }
         out->Release();
     }
     adapter->Release();
-    if (!output) Fatal("Source monitor not found");
+    if (!output)
+        Fatal("Source monitor not found");
 
     // Try IDXGIOutput6 first (Windows 10 1803+), then IDXGIOutput5, then fall back to IDXGIOutput1
     // DuplicateOutput1 allows us to request HDR format (R16G16B16A16_FLOAT)
-    IDXGIOutput6* out6 = nullptr;
-    IDXGIOutput5* out5 = nullptr;
-    IDXGIOutput1* out1 = nullptr;
+    IDXGIOutput6 *out6 = nullptr;
+    IDXGIOutput5 *out5 = nullptr;
+    IDXGIOutput1 *out1 = nullptr;
 
     // Formats we support, in order of preference
     DXGI_FORMAT supportedFormats[] = {
-        DXGI_FORMAT_R16G16B16A16_FLOAT,  // HDR
-        DXGI_FORMAT_B8G8R8A8_UNORM,      // SDR
+        DXGI_FORMAT_R16G16B16A16_FLOAT, // HDR
+        DXGI_FORMAT_B8G8R8A8_UNORM,     // SDR
     };
 
     hr = output->QueryInterface(&out6);
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(hr))
+    {
         hr = out6->DuplicateOutput1(g.capDevice, 0, _countof(supportedFormats), supportedFormats, &g.duplication);
         out6->Release();
-        if (SUCCEEDED(hr)) {
-            if (g.debug) printf("[DEBUG] Using IDXGIOutput6::DuplicateOutput1 (HDR supported)\n");
+        if (SUCCEEDED(hr))
+        {
+            if (g.debug)
+                printf("[DEBUG] Using IDXGIOutput6::DuplicateOutput1 (HDR supported)\n");
         }
     }
 
-    if (!g.duplication) {
+    if (!g.duplication)
+    {
         hr = output->QueryInterface(&out5);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr))
+        {
             hr = out5->DuplicateOutput1(g.capDevice, 0, _countof(supportedFormats), supportedFormats, &g.duplication);
             out5->Release();
-            if (SUCCEEDED(hr)) {
-                if (g.debug) printf("[DEBUG] Using IDXGIOutput5::DuplicateOutput1 (HDR supported)\n");
+            if (SUCCEEDED(hr))
+            {
+                if (g.debug)
+                    printf("[DEBUG] Using IDXGIOutput5::DuplicateOutput1 (HDR supported)\n");
             }
         }
     }
 
-    if (!g.duplication) {
+    if (!g.duplication)
+    {
         // Fall back to old method (no HDR support)
         hr = output->QueryInterface(&out1);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr))
+        {
             hr = out1->DuplicateOutput(g.capDevice, &g.duplication);
             out1->Release();
-            if (SUCCEEDED(hr)) {
-                if (g.debug) printf("[DEBUG] Using IDXGIOutput1::DuplicateOutput (no HDR support)\n");
+            if (SUCCEEDED(hr))
+            {
+                if (g.debug)
+                    printf("[DEBUG] Using IDXGIOutput1::DuplicateOutput (no HDR support)\n");
             }
         }
     }
 
     output->Release();
-    if (FAILED(hr) || !g.duplication) Fatal("DuplicateOutput", hr);
+    if (FAILED(hr) || !g.duplication)
+        Fatal("DuplicateOutput", hr);
 
-    DXGI_OUTDUPL_DESC dd; g.duplication->GetDesc(&dd);
+    DXGI_OUTDUPL_DESC dd;
+    g.duplication->GetDesc(&dd);
 
     g.sourceReportedHDR = (dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
     g.sourceRefreshRate = (float)dd.ModeDesc.RefreshRate.Numerator / dd.ModeDesc.RefreshRate.Denominator;
@@ -853,8 +980,10 @@ void InitDuplication() {
            dd.ModeDesc.Width, dd.ModeDesc.Height, g.sourceRefreshRate);
 }
 
-void InitTripleBuffer(DXGI_FORMAT format, UINT width, UINT height) {
-    if (g.debug) {
+void InitTripleBuffer(DXGI_FORMAT format, UINT width, UINT height)
+{
+    if (g.debug)
+    {
         printf("[DEBUG] InitTripleBuffer: %ux%u, Format=%d\n", width, height, (int)format);
     }
 
@@ -871,68 +1000,106 @@ void InitTripleBuffer(DXGI_FORMAT format, UINT width, UINT height) {
 
     DXGI_FORMAT srvFormat = format;
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3; i++)
+    {
         HRESULT hr = g.device->CreateTexture2D(&td, nullptr, &g.buffer.textures[i]);
-        if (FAILED(hr)) Fatal("CreateTexture2D (triple buffer)", hr);
+        if (FAILED(hr))
+            Fatal("CreateTexture2D (triple buffer)", hr);
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
         srvd.Format = srvFormat;
         srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvd.Texture2D.MipLevels = 1;
         hr = g.device->CreateShaderResourceView(g.buffer.textures[i], &srvd, &g.buffer.srvs[i]);
-        if (FAILED(hr)) Fatal("CreateSRV (triple buffer)", hr);
+        if (FAILED(hr))
+            Fatal("CreateSRV (triple buffer)", hr);
     }
 
-    if (g.debug) {
+    if (g.debug)
+    {
         printf("[DEBUG] Triple buffer created successfully\n");
     }
 }
 
 // Capture thread
-void CaptureThreadFunc() {
-    ID3D11Texture2D* sharedTex[3] = {nullptr, nullptr, nullptr};
+void CaptureThreadFunc()
+{
+    // Boost thread priority for lower latency frame capture
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    ID3D11Texture2D *sharedTex[3] = {nullptr, nullptr, nullptr};
     bool buffersOpened = false;
     int debugCounter = 0;
 
-    while (g.running) {
+    // GPU event query for synchronization - ensures copy completes before publishing
+    ID3D11Query *gpuFence = nullptr;
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    g.capDevice->CreateQuery(&qd, &gpuFence);
+
+    LARGE_INTEGER perfFreq, t1, t2;
+    QueryPerformanceFrequency(&perfFreq);
+    double ticksToUs = 1000000.0 / perfFreq.QuadPart;
+
+    while (g.running)
+    {
         DXGI_OUTDUPL_FRAME_INFO info;
-        IDXGIResource* res = nullptr;
+        IDXGIResource *res = nullptr;
 
+        QueryPerformanceCounter(&t1);
         HRESULT hr = g.duplication->AcquireNextFrame(100, &info, &res);
+        QueryPerformanceCounter(&t2);
 
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            if (g.debug && (++debugCounter % 10 == 0)) {
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+        {
+            if (g.debug && (++debugCounter % 10 == 0))
+            {
                 printf("[DEBUG] AcquireNextFrame timeout\n");
             }
             continue;
         }
 
-        if (hr == DXGI_ERROR_ACCESS_LOST) {
-            if (g.debug) printf("[DEBUG] Access lost, reinitializing...\n");
-            if (g.duplication) { g.duplication->Release(); g.duplication = nullptr; }
+        // Track time spent in AcquireNextFrame (for successful acquires only)
+        g.capTimeAcquire.fetch_add((int)((t2.QuadPart - t1.QuadPart) * ticksToUs), std::memory_order_relaxed);
+        g.capLoopCount.fetch_add(1, std::memory_order_relaxed);
+
+        if (hr == DXGI_ERROR_ACCESS_LOST)
+        {
+            if (g.debug)
+                printf("[DEBUG] Access lost, reinitializing...\n");
+            if (g.duplication)
+            {
+                g.duplication->Release();
+                g.duplication = nullptr;
+            }
             Sleep(100);
             InitDuplication();
             continue;
         }
 
-        if (FAILED(hr)) {
-            if (g.debug) printf("[DEBUG] AcquireNextFrame failed: 0x%08X\n", (unsigned)hr);
+        if (FAILED(hr))
+        {
+            if (g.debug)
+                printf("[DEBUG] AcquireNextFrame failed: 0x%08X\n", (unsigned)hr);
             continue;
         }
 
-        // Capture cursor info (always, not just on new content)
-        if (g.showCursor) {
+        // Capture cursor info (only if cursor is enabled)
+        if (g.showCursor)
+        {
             // Update cursor position only if we got a mouse update
-            // (LastMouseUpdateTime is non-zero when there's a cursor update)
-            if (info.LastMouseUpdateTime.QuadPart != 0) {
+            if (info.LastMouseUpdateTime.QuadPart != 0)
+            {
                 g.cursor.visible.store(info.PointerPosition.Visible != 0, std::memory_order_relaxed);
                 g.cursor.x.store(info.PointerPosition.Position.x, std::memory_order_relaxed);
                 g.cursor.y.store(info.PointerPosition.Position.y, std::memory_order_relaxed);
             }
 
             // Get cursor shape if it changed
-            if (info.PointerShapeBufferSize > 0) {
-                if (g.cursor.shapeBufferSize < info.PointerShapeBufferSize) {
+            if (info.PointerShapeBufferSize > 0)
+            {
+                if (g.cursor.shapeBufferSize < info.PointerShapeBufferSize)
+                {
                     delete[] g.cursor.shapeBuffer;
                     g.cursor.shapeBuffer = new BYTE[info.PointerShapeBufferSize];
                     g.cursor.shapeBufferSize = info.PointerShapeBufferSize;
@@ -944,29 +1111,18 @@ void CaptureThreadFunc() {
                     g.cursor.shapeBufferSize, g.cursor.shapeBuffer,
                     &bufferSizeRequired, &shapeInfo);
 
-                if (SUCCEEDED(hr)) {
+                if (SUCCEEDED(hr))
+                {
                     g.cursor.shapeWidth = shapeInfo.Width;
                     g.cursor.shapeHeight = shapeInfo.Height;
                     g.cursor.shapePitch = shapeInfo.Pitch;
                     g.cursor.shapeType = (DXGI_OUTDUPL_POINTER_SHAPE_TYPE)shapeInfo.Type;
                     g.cursor.width.store(shapeInfo.Width, std::memory_order_relaxed);
                     g.cursor.height.store(
-                        shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ?
-                        shapeInfo.Height / 2 : shapeInfo.Height,
+                        shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ? shapeInfo.Height / 2 : shapeInfo.Height,
                         std::memory_order_relaxed);
                     g.cursor.hasShape.store(true, std::memory_order_relaxed);
                     g.cursor.shapeUpdated.store(true, std::memory_order_release);
-
-                    if (g.debug) {
-                        const char* typeStr = "UNKNOWN";
-                        switch (shapeInfo.Type) {
-                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME: typeStr = "MONOCHROME"; break;
-                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR: typeStr = "COLOR"; break;
-                            case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR: typeStr = "MASKED_COLOR"; break;
-                        }
-                        printf("[DEBUG] Cursor shape: %s %ux%u pitch=%u\n",
-                               typeStr, shapeInfo.Width, shapeInfo.Height, shapeInfo.Pitch);
-                    }
                 }
             }
         }
@@ -974,39 +1130,49 @@ void CaptureThreadFunc() {
         // Check for new frame content
         bool hasNewContent = (info.LastPresentTime.QuadPart != 0) ||
                              (info.AccumulatedFrames > 0) ||
-                             !buffersOpened;  // Always process first frame
+                             !buffersOpened; // Always process first frame
 
         // Track frames dropped by DWM (we missed frames between acquires)
-        if (info.AccumulatedFrames > 1) {
+        if (info.AccumulatedFrames > 1)
+        {
             g.droppedByDwm.fetch_add(info.AccumulatedFrames - 1, std::memory_order_relaxed);
         }
 
-        if (hasNewContent) {
-            ID3D11Texture2D* tex;
+        if (hasNewContent)
+        {
+            ID3D11Texture2D *tex;
             hr = res->QueryInterface(&tex);
 
-            if (SUCCEEDED(hr)) {
+            if (SUCCEEDED(hr))
+            {
                 // On first frame, detect actual format and initialize buffers
-                if (!buffersOpened) {
+                if (!buffersOpened)
+                {
                     D3D11_TEXTURE2D_DESC td;
                     tex->GetDesc(&td);
 
                     printf("  Actual format: %s (DXGI_FORMAT=%d)\n",
-                           td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "HDR (R16G16B16A16_FLOAT)" :
-                           td.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? "SDR (B8G8R8A8_UNORM)" : "Other",
+                           td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "HDR (R16G16B16A16_FLOAT)" : td.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? "SDR (B8G8R8A8_UNORM)"
+                                                                                                                                              : "Other",
                            (int)td.Format);
 
                     // Update global format info
                     g.sourceFormat = td.Format;
                     g.sourceIsHDR = (td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
-                    if (g.sourceIsHDR) {
-                        if (g.tonemap) {
+                    if (g.sourceIsHDR)
+                    {
+                        if (g.tonemap)
+                        {
                             printf("  Processing: maxRGB Reinhard tonemapping (HDR to SDR, sdrWhite=%.0f nits)\n", g.sdrWhiteNits);
-                        } else {
+                        }
+                        else
+                        {
                             printf("  Processing: None (--no-tonemap, HDR values may clip)\n");
                         }
-                    } else {
+                    }
+                    else
+                    {
                         printf("  Processing: Passthrough (SDR)\n");
                     }
 
@@ -1014,70 +1180,104 @@ void CaptureThreadFunc() {
                     InitTripleBuffer(td.Format, td.Width, td.Height);
 
                     // Open shared handles
-                    for (int i = 0; i < 3; i++) {
-                        IDXGIResource* bufRes;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        IDXGIResource *bufRes;
                         g.buffer.textures[i]->QueryInterface(&bufRes);
                         HANDLE sharedHandle;
                         bufRes->GetSharedHandle(&sharedHandle);
                         bufRes->Release();
 
                         hr = g.capDevice->OpenSharedResource(sharedHandle,
-                            __uuidof(ID3D11Texture2D), (void**)&sharedTex[i]);
-                        if (FAILED(hr)) Fatal("OpenSharedResource", hr);
+                                                             __uuidof(ID3D11Texture2D), (void **)&sharedTex[i]);
+                        if (FAILED(hr))
+                            Fatal("OpenSharedResource", hr);
                     }
 
                     buffersOpened = true;
 
-                    if (g.debug) {
+                    if (g.debug)
+                    {
                         printf("[DEBUG] Buffers initialized with actual format\n");
                     }
                 }
 
+                QueryPerformanceCounter(&t1);
                 int writeIdx = g.buffer.GetWriteIndex();
                 g.capContext->CopyResource(sharedTex[writeIdx], tex);
+
+                // GPU fence: signal completion of copy, then wait for it
+                // This ensures the texture data is fully written before we publish
+                g.capContext->End(gpuFence);
                 g.capContext->Flush();
+                while (g.capContext->GetData(gpuFence, nullptr, 0, 0) == S_FALSE)
+                {
+                    // Spin-wait for GPU copy completion (typically very fast)
+                    _mm_pause(); // CPU hint: we're spin-waiting
+                }
+                QueryPerformanceCounter(&t2);
+                g.capTimeCopy.fetch_add((int)((t2.QuadPart - t1.QuadPart) * ticksToUs), std::memory_order_relaxed);
 
                 UINT64 frameId = g.captureFrameId.fetch_add(1, std::memory_order_relaxed) + 1;
                 g.buffer.PublishFrame(frameId);
                 g.captureCount.fetch_add(1, std::memory_order_relaxed);
 
                 // Signal buffer ready AFTER first frame is copied and published
-                if (!g.bufferInitialized.load(std::memory_order_relaxed)) {
+                if (!g.bufferInitialized.load(std::memory_order_relaxed))
+                {
                     g.bufferInitialized.store(true, std::memory_order_release);
                 }
 
                 tex->Release();
-            } else {
-                if (g.debug) printf("[DEBUG] QueryInterface for texture failed: 0x%08X\n", (unsigned)hr);
+            }
+            else
+            {
+                if (g.debug)
+                    printf("[DEBUG] QueryInterface for texture failed: 0x%08X\n", (unsigned)hr);
             }
         }
 
         res->Release();
+        QueryPerformanceCounter(&t1);
         g.duplication->ReleaseFrame();
+        QueryPerformanceCounter(&t2);
+        g.capTimeRelease.fetch_add((int)((t2.QuadPart - t1.QuadPart) * ticksToUs), std::memory_order_relaxed);
     }
 
-    for (int i = 0; i < 3; i++) {
-        if (sharedTex[i]) sharedTex[i]->Release();
+    for (int i = 0; i < 3; i++)
+    {
+        if (sharedTex[i])
+            sharedTex[i]->Release();
     }
+
+    if (gpuFence)
+        gpuFence->Release();
 }
 
 static int s_renderDebugCounter = 0;
 static bool s_firstRenderDone = false;
 
-void Render() {
-    if (!g.bufferInitialized.load(std::memory_order_acquire)) {
-        if (g.debug && (++s_renderDebugCounter % 60 == 0)) {
+void Render()
+{
+    if (!g.bufferInitialized.load(std::memory_order_acquire))
+    {
+        if (g.debug && (++s_renderDebugCounter % 60 == 0))
+        {
             printf("[DEBUG] Render: buffer not initialized\n");
         }
         return;
     }
 
     UINT64 acquiredFrameId = 0;
-    int readIdx = g.buffer.AcquireFrame(&acquiredFrameId);
+    int bufIdx = -1;
+    int readIdx = g.buffer.AcquireFrame(&acquiredFrameId, &bufIdx);
     g.lastAcquiredFrameId = acquiredFrameId;
+    g.lastAcquiredBufIdx = bufIdx;
 
-    if (readIdx < 0) {
-        if (g.debug && (++s_renderDebugCounter % 60 == 0)) {
+    if (readIdx < 0)
+    {
+        if (g.debug && (++s_renderDebugCounter % 60 == 0))
+        {
             printf("[DEBUG] Render: no frame available (readIdx=%d, writeIdx=%d, readyIdx=%d, displayIdx=%d)\n",
                    readIdx,
                    g.buffer.writeIdx.load(),
@@ -1087,19 +1287,22 @@ void Render() {
         return;
     }
 
-    ID3D11ShaderResourceView* srv = g.buffer.srvs[readIdx];
-    if (!srv) {
-        if (g.debug) printf("[DEBUG] Render: SRV is null for readIdx=%d\n", readIdx);
+    ID3D11ShaderResourceView *srv = g.buffer.srvs[readIdx];
+    if (!srv)
+    {
+        if (g.debug)
+            printf("[DEBUG] Render: SRV is null for readIdx=%d\n", readIdx);
         return;
     }
 
-    if (g.debug && !s_firstRenderDone) {
+    if (g.debug && !s_firstRenderDone)
+    {
         printf("[DEBUG] First render: readIdx=%d, sourceIsHDR=%d, tonemap=%d\n",
                readIdx, g.sourceIsHDR, g.tonemap);
         s_firstRenderDone = true;
     }
 
-    float black[] = {0,0,0,1};
+    float black[] = {0, 0, 0, 1};
     g.context->OMSetRenderTargets(1, &g.rtv, nullptr);
     g.context->ClearRenderTargetView(g.rtv, black);
     g.context->RSSetViewports(1, &g.viewport);
@@ -1107,50 +1310,61 @@ void Render() {
     g.context->VSSetShader(g.vs, 0, 0);
 
     // Select pixel shader and sampler based on scale filter and source format
-    ID3D11SamplerState* currentSampler = g.sampler;  // Default: linear (bilinear)
+    ID3D11SamplerState *currentSampler = g.sampler; // Default: linear (bilinear)
     bool useScaleShader = false;
 
-    if (g.scaleFilter == SCALE_POINT) {
+    if (g.scaleFilter == SCALE_POINT)
+    {
         currentSampler = g.samplerPoint;
-    } else if (g.scaleFilter == SCALE_BICUBIC || g.scaleFilter == SCALE_LANCZOS) {
+    }
+    else if (g.scaleFilter == SCALE_BICUBIC || g.scaleFilter == SCALE_LANCZOS)
+    {
         useScaleShader = true;
     }
 
-    if (useScaleShader) {
+    if (useScaleShader)
+    {
         // Use Lanczos or Bicubic shader with integrated HDR support
         D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(g.context->Map(g.cbScale, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            float* data = (float*)mapped.pData;
+        if (SUCCEEDED(g.context->Map(g.cbScale, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            float *data = (float *)mapped.pData;
             // Get source texture dimensions
             float srcW = (float)(g.sourceRect.right - g.sourceRect.left);
             float srcH = (float)(g.sourceRect.bottom - g.sourceRect.top);
-            data[0] = srcW;                    // texSize.x
-            data[1] = srcH;                    // texSize.y
-            data[2] = 1.0f / srcW;             // invTexSize.x
-            data[3] = 1.0f / srcH;             // invTexSize.y
-            data[4] = g.sdrWhiteNits;          // sdrWhiteNits
-            data[5] = (g.sourceIsHDR && g.tonemap) ? 1.0f : 0.0f;  // enableHDR
-            data[6] = 0.0f;                    // padding
-            data[7] = 0.0f;                    // padding
+            data[0] = srcW;                                       // texSize.x
+            data[1] = srcH;                                       // texSize.y
+            data[2] = 1.0f / srcW;                                // invTexSize.x
+            data[3] = 1.0f / srcH;                                // invTexSize.y
+            data[4] = g.sdrWhiteNits;                             // sdrWhiteNits
+            data[5] = (g.sourceIsHDR && g.tonemap) ? 1.0f : 0.0f; // enableHDR
+            data[6] = 0.0f;                                       // padding
+            data[7] = 0.0f;                                       // padding
             g.context->Unmap(g.cbScale, 0);
         }
         g.context->PSSetConstantBuffers(0, 1, &g.cbScale);
         g.context->PSSetShader(g.scaleFilter == SCALE_LANCZOS ? g.psLanczos : g.psBicubic, 0, 0);
-    } else {
+    }
+    else
+    {
         // Use standard SDR/HDR shader with sampler-based filtering
-        if (g.sourceIsHDR && g.tonemap) {
+        if (g.sourceIsHDR && g.tonemap)
+        {
             D3D11_MAPPED_SUBRESOURCE mapped;
-            if (SUCCEEDED(g.context->Map(g.cbHDR, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                float* data = (float*)mapped.pData;
+            if (SUCCEEDED(g.context->Map(g.cbHDR, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            {
+                float *data = (float *)mapped.pData;
                 data[0] = g.sdrWhiteNits;
-                data[1] = 0.0f;  // padding
+                data[1] = 0.0f; // padding
                 data[2] = 0.0f;
                 data[3] = 0.0f;
                 g.context->Unmap(g.cbHDR, 0);
             }
             g.context->PSSetConstantBuffers(0, 1, &g.cbHDR);
             g.context->PSSetShader(g.psHDR, 0, 0);
-        } else {
+        }
+        else
+        {
             g.context->PSSetShader(g.psSDR, 0, 0);
         }
     }
@@ -1167,17 +1381,28 @@ void Render() {
 
     // Render cursor if visible and we have a shape
     if (g.showCursor && g.cursor.hasShape.load(std::memory_order_relaxed) &&
-        g.cursor.visible.load(std::memory_order_relaxed)) {
+        g.cursor.visible.load(std::memory_order_relaxed))
+    {
         // Update cursor texture if shape changed
-        if (g.cursor.shapeUpdated.exchange(false, std::memory_order_acquire)) {
+        if (g.cursor.shapeUpdated.exchange(false, std::memory_order_acquire))
+        {
             // Release old texture
-            if (g.cursorSrv) { g.cursorSrv->Release(); g.cursorSrv = nullptr; }
-            if (g.cursorTex) { g.cursorTex->Release(); g.cursorTex = nullptr; }
+            if (g.cursorSrv)
+            {
+                g.cursorSrv->Release();
+                g.cursorSrv = nullptr;
+            }
+            if (g.cursorTex)
+            {
+                g.cursorTex->Release();
+                g.cursorTex = nullptr;
+            }
 
             UINT width = g.cursor.shapeWidth;
             UINT height = g.cursor.shapeHeight;
-            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
-                height /= 2;  // Monochrome cursors are AND mask + XOR mask
+            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME)
+            {
+                height /= 2; // Monochrome cursors are AND mask + XOR mask
             }
 
             // Create cursor texture
@@ -1192,73 +1417,99 @@ void Render() {
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
             // Convert cursor data to BGRA with proper alpha
-            UINT* pixels = new UINT[width * height];
+            UINT *pixels = new UINT[width * height];
 
-            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+            if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME)
+            {
                 // Monochrome: AND mask then XOR mask, each 1 bit per pixel
                 // Output in premultiplied alpha format
                 UINT pitch = g.cursor.shapePitch;
-                for (UINT y = 0; y < height; y++) {
-                    for (UINT x = 0; x < width; x++) {
+                for (UINT y = 0; y < height; y++)
+                {
+                    for (UINT x = 0; x < width; x++)
+                    {
                         UINT byteIdx = x / 8;
                         UINT bitIdx = 7 - (x % 8);
                         BYTE andMask = (g.cursor.shapeBuffer[y * pitch + byteIdx] >> bitIdx) & 1;
                         BYTE xorMask = (g.cursor.shapeBuffer[(y + height) * pitch + byteIdx] >> bitIdx) & 1;
 
-                        if (andMask == 0 && xorMask == 0) {
+                        if (andMask == 0 && xorMask == 0)
+                        {
                             // Black, opaque (premul: RGB=0, A=255)
                             pixels[y * width + x] = 0xFF000000;
-                        } else if (andMask == 0 && xorMask == 1) {
+                        }
+                        else if (andMask == 0 && xorMask == 1)
+                        {
                             // White, opaque (premul: RGB=255, A=255)
                             pixels[y * width + x] = 0xFFFFFFFF;
-                        } else if (andMask == 1 && xorMask == 0) {
+                        }
+                        else if (andMask == 1 && xorMask == 0)
+                        {
                             // Transparent (premul: all zero)
                             pixels[y * width + x] = 0x00000000;
-                        } else {
+                        }
+                        else
+                        {
                             // XOR (invert) - approximate as semi-transparent white
                             // Premul: RGB=128 (255*0.5), A=128
                             pixels[y * width + x] = 0x80808080;
                         }
                     }
                 }
-            } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+            }
+            else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR)
+            {
                 // Color cursor: BGRA format, already premultiplied alpha from Windows
                 // Debug: analyze pixel values
                 // Color cursor: BGRA format, copy as-is (already premultiplied)
-                for (UINT y = 0; y < height; y++) {
-                    for (UINT x = 0; x < width; x++) {
-                        BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
-                        pixels[y * width + x] = *(UINT*)src;
+                for (UINT y = 0; y < height; y++)
+                {
+                    for (UINT x = 0; x < width; x++)
+                    {
+                        BYTE *src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
+                        pixels[y * width + x] = *(UINT *)src;
                     }
                 }
-            } else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+            }
+            else if (g.cursor.shapeType == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR)
+            {
                 // Masked color cursor format (per Microsoft DXGI docs):
                 // - Alpha = 0x00: DRAW this pixel with RGB color (solid)
                 // - Alpha = 0xFF: XOR with screen (if RGB=black, effectively transparent)
-                for (UINT y = 0; y < height; y++) {
-                    for (UINT x = 0; x < width; x++) {
-                        BYTE* src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
+                for (UINT y = 0; y < height; y++)
+                {
+                    for (UINT x = 0; x < width; x++)
+                    {
+                        BYTE *src = &g.cursor.shapeBuffer[y * g.cursor.shapePitch + x * 4];
                         BYTE b = src[0], gc = src[1], r = src[2], a = src[3];
 
-                        if (a == 0x00) {
+                        if (a == 0x00)
+                        {
                             // MASKED_COLOR: a=0 means DRAW this pixel (solid, opaque)
                             pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
-                        } else if (a == 0xFF) {
+                        }
+                        else if (a == 0xFF)
+                        {
                             // MASKED_COLOR: a=0xFF means XOR with screen
                             // XOR with black (RGB=0) = no change = transparent
                             // XOR with white/color = show that color (visible on most backgrounds)
-                            if (r == 0 && gc == 0 && b == 0) {
+                            if (r == 0 && gc == 0 && b == 0)
+                            {
                                 // XOR black = transparent
                                 pixels[y * width + x] = 0x00000000;
-                            } else {
+                            }
+                            else
+                            {
                                 // XOR color - show the color directly (premultiplied, fully opaque)
                                 // This makes white I-beam cursors visible
                                 pixels[y * width + x] = 0xFF000000 | (r << 16) | (gc << 8) | b;
                             }
-                        } else {
+                        }
+                        else
+                        {
                             // Partial alpha - treat as blend factor
                             // a closer to 0 = more solid, a closer to 255 = more XOR
-                            BYTE opacity = (BYTE)(255 - a);  // Invert: 0->255, 255->0
+                            BYTE opacity = (BYTE)(255 - a); // Invert: 0->255, 255->0
                             BYTE pr = (BYTE)(r * opacity / 255);
                             BYTE pg = (BYTE)(gc * opacity / 255);
                             BYTE pb = (BYTE)(b * opacity / 255);
@@ -1275,7 +1526,8 @@ void Render() {
             g.device->CreateTexture2D(&td, &initData, &g.cursorTex);
             delete[] pixels;
 
-            if (g.cursorTex) {
+            if (g.cursorTex)
+            {
                 D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
                 srvd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1285,7 +1537,8 @@ void Render() {
         }
 
         // Draw cursor if we have a texture
-        if (g.cursorSrv) {
+        if (g.cursorSrv)
+        {
             int cursorX = g.cursor.x.load(std::memory_order_relaxed);
             int cursorY = g.cursor.y.load(std::memory_order_relaxed);
             int cursorW = g.cursor.width.load(std::memory_order_relaxed);
@@ -1318,12 +1571,13 @@ void Render() {
 
             // Update cursor vertex buffer
             D3D11_MAPPED_SUBRESOURCE mapped;
-            if (SUCCEEDED(g.context->Map(g.cursorVb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                Vertex* verts = (Vertex*)mapped.pData;
-                verts[0] = {ndcX1, ndcY1, 0, 0};  // Top-left
-                verts[1] = {ndcX2, ndcY1, 1, 0};  // Top-right
-                verts[2] = {ndcX1, ndcY2, 0, 1};  // Bottom-left
-                verts[3] = {ndcX2, ndcY2, 1, 1};  // Bottom-right
+            if (SUCCEEDED(g.context->Map(g.cursorVb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            {
+                Vertex *verts = (Vertex *)mapped.pData;
+                verts[0] = {ndcX1, ndcY1, 0, 0}; // Top-left
+                verts[1] = {ndcX2, ndcY1, 1, 0}; // Top-right
+                verts[2] = {ndcX1, ndcY2, 0, 1}; // Bottom-left
+                verts[3] = {ndcX2, ndcY2, 1, 1}; // Bottom-right
                 g.context->Unmap(g.cursorVb, 0);
             }
 
@@ -1334,7 +1588,7 @@ void Render() {
             // Draw cursor
             g.context->PSSetShader(g.psCursor, 0, 0);
             g.context->PSSetShaderResources(0, 1, &g.cursorSrv);
-            g.context->PSSetSamplers(0, 1, &g.sampler);  // Bilinear sampling for smooth cursor scaling
+            g.context->PSSetSamplers(0, 1, &g.sampler); // Bilinear sampling for smooth cursor scaling
             UINT stride = sizeof(Vertex), offset = 0;
             g.context->IASetVertexBuffers(0, 1, &g.cursorVb, &stride, &offset);
             g.context->Draw(4, 0);
@@ -1345,61 +1599,179 @@ void Render() {
         }
     }
 
-    ID3D11ShaderResourceView* null = nullptr;
+    ID3D11ShaderResourceView *null = nullptr;
     g.context->PSSetShaderResources(0, 1, &null);
 }
 
-void Cleanup() {
+void Cleanup()
+{
     g.running = false;
 
     // Wait for capture thread
-    if (g.captureThread.joinable()) {
+    if (g.captureThread.joinable())
+    {
         g.captureThread.join();
     }
 
     // Release triple buffer (may not be initialized if we exit early)
-    if (g.bufferInitialized.load(std::memory_order_acquire)) {
-        for (int i = 0; i < 3; i++) {
-            if (g.buffer.srvs[i]) { g.buffer.srvs[i]->Release(); g.buffer.srvs[i] = nullptr; }
-            if (g.buffer.textures[i]) { g.buffer.textures[i]->Release(); g.buffer.textures[i] = nullptr; }
+    if (g.bufferInitialized.load(std::memory_order_acquire))
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            if (g.buffer.srvs[i])
+            {
+                g.buffer.srvs[i]->Release();
+                g.buffer.srvs[i] = nullptr;
+            }
+            if (g.buffer.textures[i])
+            {
+                g.buffer.textures[i]->Release();
+                g.buffer.textures[i] = nullptr;
+            }
         }
     }
 
     // Release capture resources
-    if (g.duplication) { g.duplication->Release(); g.duplication = nullptr; }
-    if (g.capContext) { g.capContext->Release(); g.capContext = nullptr; }
-    if (g.capDevice) { g.capDevice->Release(); g.capDevice = nullptr; }
+    if (g.duplication)
+    {
+        g.duplication->Release();
+        g.duplication = nullptr;
+    }
+    if (g.capContext)
+    {
+        g.capContext->Release();
+        g.capContext = nullptr;
+    }
+    if (g.capDevice)
+    {
+        g.capDevice->Release();
+        g.capDevice = nullptr;
+    }
 
     // Release cursor resources
-    if (g.cursorSrv) { g.cursorSrv->Release(); g.cursorSrv = nullptr; }
-    if (g.cursorTex) { g.cursorTex->Release(); g.cursorTex = nullptr; }
-    if (g.cursorVb) { g.cursorVb->Release(); g.cursorVb = nullptr; }
-    if (g.blendState) { g.blendState->Release(); g.blendState = nullptr; }
-    if (g.psCursor) { g.psCursor->Release(); g.psCursor = nullptr; }
-    delete[] g.cursor.shapeBuffer; g.cursor.shapeBuffer = nullptr;
+    if (g.cursorSrv)
+    {
+        g.cursorSrv->Release();
+        g.cursorSrv = nullptr;
+    }
+    if (g.cursorTex)
+    {
+        g.cursorTex->Release();
+        g.cursorTex = nullptr;
+    }
+    if (g.cursorVb)
+    {
+        g.cursorVb->Release();
+        g.cursorVb = nullptr;
+    }
+    if (g.blendState)
+    {
+        g.blendState->Release();
+        g.blendState = nullptr;
+    }
+    if (g.psCursor)
+    {
+        g.psCursor->Release();
+        g.psCursor = nullptr;
+    }
+    delete[] g.cursor.shapeBuffer;
+    g.cursor.shapeBuffer = nullptr;
 
     // Release render resources
-    if (g.samplerPoint) { g.samplerPoint->Release(); g.samplerPoint = nullptr; }
-    if (g.sampler) { g.sampler->Release(); g.sampler = nullptr; }
-    if (g.cbScale) { g.cbScale->Release(); g.cbScale = nullptr; }
-    if (g.cbHDR) { g.cbHDR->Release(); g.cbHDR = nullptr; }
-    if (g.vb) { g.vb->Release(); g.vb = nullptr; }
-    if (g.layout) { g.layout->Release(); g.layout = nullptr; }
-    if (g.psBicubic) { g.psBicubic->Release(); g.psBicubic = nullptr; }
-    if (g.psLanczos) { g.psLanczos->Release(); g.psLanczos = nullptr; }
-    if (g.psHDR) { g.psHDR->Release(); g.psHDR = nullptr; }
-    if (g.psSDRGamma) { g.psSDRGamma->Release(); g.psSDRGamma = nullptr; }
-    if (g.psSDR) { g.psSDR->Release(); g.psSDR = nullptr; }
-    if (g.vs) { g.vs->Release(); g.vs = nullptr; }
-    if (g.rtv) { g.rtv->Release(); g.rtv = nullptr; }
-    if (g.frameLatencyWaitable) { CloseHandle(g.frameLatencyWaitable); g.frameLatencyWaitable = nullptr; }
-    if (g.swapChain) { g.swapChain->Release(); g.swapChain = nullptr; }
-    if (g.context) { g.context->Release(); g.context = nullptr; }
-    if (g.device) { g.device->Release(); g.device = nullptr; }
-    if (g.hwnd) { DestroyWindow(g.hwnd); g.hwnd = nullptr; }
+    if (g.samplerPoint)
+    {
+        g.samplerPoint->Release();
+        g.samplerPoint = nullptr;
+    }
+    if (g.sampler)
+    {
+        g.sampler->Release();
+        g.sampler = nullptr;
+    }
+    if (g.cbScale)
+    {
+        g.cbScale->Release();
+        g.cbScale = nullptr;
+    }
+    if (g.cbHDR)
+    {
+        g.cbHDR->Release();
+        g.cbHDR = nullptr;
+    }
+    if (g.vb)
+    {
+        g.vb->Release();
+        g.vb = nullptr;
+    }
+    if (g.layout)
+    {
+        g.layout->Release();
+        g.layout = nullptr;
+    }
+    if (g.psBicubic)
+    {
+        g.psBicubic->Release();
+        g.psBicubic = nullptr;
+    }
+    if (g.psLanczos)
+    {
+        g.psLanczos->Release();
+        g.psLanczos = nullptr;
+    }
+    if (g.psHDR)
+    {
+        g.psHDR->Release();
+        g.psHDR = nullptr;
+    }
+    if (g.psSDRGamma)
+    {
+        g.psSDRGamma->Release();
+        g.psSDRGamma = nullptr;
+    }
+    if (g.psSDR)
+    {
+        g.psSDR->Release();
+        g.psSDR = nullptr;
+    }
+    if (g.vs)
+    {
+        g.vs->Release();
+        g.vs = nullptr;
+    }
+    if (g.rtv)
+    {
+        g.rtv->Release();
+        g.rtv = nullptr;
+    }
+    if (g.frameLatencyWaitable)
+    {
+        CloseHandle(g.frameLatencyWaitable);
+        g.frameLatencyWaitable = nullptr;
+    }
+    if (g.swapChain)
+    {
+        g.swapChain->Release();
+        g.swapChain = nullptr;
+    }
+    if (g.context)
+    {
+        g.context->Release();
+        g.context = nullptr;
+    }
+    if (g.device)
+    {
+        g.device->Release();
+        g.device = nullptr;
+    }
+    if (g.hwnd)
+    {
+        DestroyWindow(g.hwnd);
+        g.hwnd = nullptr;
+    }
 }
 
-void PrintUsage(const char* prog) {
+void PrintUsage(const char *prog)
+{
     printf("DXGI Desktop Mirror\n\n");
     printf("Usage: %s [options]\n\n", prog);
     printf("  --source N       Source monitor (default: 0)\n");
@@ -1419,51 +1791,101 @@ void PrintUsage(const char* prog) {
     printf("  --list           List monitors\n");
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // Install console control handler for graceful CTRL+C shutdown
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--source") && i+1 < argc) g.sourceMonitor = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--target") && i+1 < argc) g.targetMonitor = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--stretch")) g.preserveAspect = false;
-        else if (!strcmp(argv[i], "--no-tonemap")) g.tonemap = false;
-        else if (!strcmp(argv[i], "--sdr-white") && i+1 < argc) g.sdrWhiteNits = (float)atof(argv[++i]);
-        else if (!strcmp(argv[i], "--no-cursor")) g.showCursor = false;
-        else if (!strcmp(argv[i], "--out") && i+1 < argc) g.userTargetFps = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--scale") && i+1 < argc) {
+    for (int i = 1; i < argc; i++)
+    {
+        if (!strcmp(argv[i], "--source") && i + 1 < argc)
+            g.sourceMonitor = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--target") && i + 1 < argc)
+            g.targetMonitor = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stretch"))
+            g.preserveAspect = false;
+        else if (!strcmp(argv[i], "--no-tonemap"))
+            g.tonemap = false;
+        else if (!strcmp(argv[i], "--sdr-white") && i + 1 < argc)
+            g.sdrWhiteNits = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--no-cursor"))
+            g.showCursor = false;
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc)
+            g.userTargetFps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc)
+        {
             i++;
-            if (!strcmp(argv[i], "point")) g.scaleFilter = SCALE_POINT;
-            else if (!strcmp(argv[i], "bilinear")) g.scaleFilter = SCALE_BILINEAR;
-            else if (!strcmp(argv[i], "bicubic")) g.scaleFilter = SCALE_BICUBIC;
-            else if (!strcmp(argv[i], "lanczos")) g.scaleFilter = SCALE_LANCZOS;
-            else { fprintf(stderr, "Unknown scale filter: %s\n", argv[i]); return 1; }
+            if (!strcmp(argv[i], "point"))
+                g.scaleFilter = SCALE_POINT;
+            else if (!strcmp(argv[i], "bilinear"))
+                g.scaleFilter = SCALE_BILINEAR;
+            else if (!strcmp(argv[i], "bicubic"))
+                g.scaleFilter = SCALE_BICUBIC;
+            else if (!strcmp(argv[i], "lanczos"))
+                g.scaleFilter = SCALE_LANCZOS;
+            else
+            {
+                fprintf(stderr, "Unknown scale filter: %s\n", argv[i]);
+                return 1;
+            }
         }
-        else if (!strcmp(argv[i], "--no-waitable")) g.useWaitableSwapChain = false;
-        else if (!strcmp(argv[i], "--no-wait-frame")) g.waitForNewFrame = false;
-        else if (!strcmp(argv[i], "--smart-select")) g.useSmartFrameSelection = true;
-        else if (!strcmp(argv[i], "--frame-delay") && i+1 < argc) { g.frameDelayUs = atoi(argv[++i]); g.useFrameDelay = true; }
-        else if (!strcmp(argv[i], "--debug")) g.debug = true;
-        else if (!strcmp(argv[i], "--list")) { PrintMonitors(); return 0; }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { PrintUsage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
+        else if (!strcmp(argv[i], "--no-waitable"))
+            g.useWaitableSwapChain = false;
+        else if (!strcmp(argv[i], "--no-wait-frame"))
+            g.waitForNewFrame = false;
+        else if (!strcmp(argv[i], "--smart-select"))
+            g.useSmartFrameSelection = true;
+        else if (!strcmp(argv[i], "--frame-delay") && i + 1 < argc)
+        {
+            g.frameDelayUs = atoi(argv[++i]);
+            g.useFrameDelay = true;
+        }
+        else if (!strcmp(argv[i], "--debug"))
+            g.debug = true;
+        else if (!strcmp(argv[i], "--list"))
+        {
+            PrintMonitors();
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
+        {
+            PrintUsage(argv[0]);
+            return 0;
+        }
+        else
+        {
+            fprintf(stderr, "Unknown: %s\n", argv[i]);
+            return 1;
+        }
     }
 
     int mc = GetMonitorCount();
-    if (g.sourceMonitor < 0 || g.sourceMonitor >= mc) { fprintf(stderr, "Invalid source\n"); return 1; }
-    if (g.targetMonitor < 0 || g.targetMonitor >= mc) { fprintf(stderr, "Invalid target\n"); return 1; }
-    if (g.sourceMonitor == g.targetMonitor) { fprintf(stderr, "Source == target\n"); return 1; }
+    if (g.sourceMonitor < 0 || g.sourceMonitor >= mc)
+    {
+        fprintf(stderr, "Invalid source\n");
+        return 1;
+    }
+    if (g.targetMonitor < 0 || g.targetMonitor >= mc)
+    {
+        fprintf(stderr, "Invalid target\n");
+        return 1;
+    }
+    if (g.sourceMonitor == g.targetMonitor)
+    {
+        fprintf(stderr, "Source == target\n");
+        return 1;
+    }
 
     GetMonitorRect(g.sourceMonitor, &g.sourceRect);
     GetMonitorRect(g.targetMonitor, &g.targetRect);
 
     printf("DXGI Desktop Mirror\n");
     printf("  Source: %d (%dx%d)\n", g.sourceMonitor,
-           g.sourceRect.right-g.sourceRect.left, g.sourceRect.bottom-g.sourceRect.top);
+           g.sourceRect.right - g.sourceRect.left, g.sourceRect.bottom - g.sourceRect.top);
     printf("  Target: %d (%dx%d)\n", g.targetMonitor,
-           g.targetRect.right-g.targetRect.left, g.targetRect.bottom-g.targetRect.top);
+           g.targetRect.right - g.targetRect.left, g.targetRect.bottom - g.targetRect.top);
     printf("  Output: VSync\n");
 
     CreateWindow_();
@@ -1477,36 +1899,50 @@ int main(int argc, char** argv) {
         g.targetRefreshRate = GetMonitorRefreshRate(g.targetMonitor);
 
         // Override with user-specified FPS if provided
-        if (g.userTargetFps >= 0) {
+        if (g.userTargetFps >= 0)
+        {
             float detectedRate = g.targetRefreshRate;
             g.targetRefreshRate = (float)g.userTargetFps;
             printf("  Target: %dHz (user override, detected: %.0fHz)\n", g.userTargetFps, detectedRate);
-        } else {
+        }
+        else
+        {
             printf("  Target: %.0fHz (auto-detected)\n", g.targetRefreshRate);
         }
 
         // Calculate target frame skip (only used if smart-select is enabled)
-        if (g.sourceRefreshRate > 0 && g.targetRefreshRate > 0) {
+        if (g.sourceRefreshRate > 0 && g.targetRefreshRate > 0)
+        {
             g.targetFrameSkip = (int)round(g.sourceRefreshRate / g.targetRefreshRate);
-            if (g.targetFrameSkip < 1) g.targetFrameSkip = 1;
+            if (g.targetFrameSkip < 1)
+                g.targetFrameSkip = 1;
         }
 
         // Print frame pacing strategy
-        if (g.userTargetFps == 0) {
+        if (g.userTargetFps == 0)
+        {
             printf("  Frame pacing: None (no VSync, unlimited)\n");
-        } else if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
+        }
+        else if (g.useSmartFrameSelection && g.targetFrameSkip > 1)
+        {
             printf("  Frame pacing: Smart selection (skip %d, source %.0fHz / target %.0fHz)\n",
                    g.targetFrameSkip, g.sourceRefreshRate, g.targetRefreshRate);
-        } else if (g.useFrameDelay && g.frameDelayUs > 0) {
+        }
+        else if (g.useFrameDelay && g.frameDelayUs > 0)
+        {
             printf("  Frame pacing: Fixed delay (%d us)\n", g.frameDelayUs);
-        } else if (g.waitForNewFrame) {
+        }
+        else if (g.waitForNewFrame)
+        {
             printf("  Frame pacing: Wait for new frame (poll every 1ms, aggressive in last 1ms)\n");
-        } else {
+        }
+        else
+        {
             printf("  Frame pacing: VSync only (may show dups)\n");
         }
 
         // Print scaling filter
-        const char* scaleNames[] = {"Point (nearest)", "Bilinear", "Bicubic (Catmull-Rom)", "Lanczos3 (highest quality)"};
+        const char *scaleNames[] = {"Point (nearest)", "Bilinear", "Bicubic (Catmull-Rom)", "Lanczos3 (highest quality)"};
         printf("  Scale filter: %s\n", scaleNames[g.scaleFilter]);
     }
 
@@ -1520,21 +1956,25 @@ int main(int argc, char** argv) {
     // Wait for first frame to initialize buffers (with timeout)
     printf("  Waiting for first frame...\n");
     int waitCount = 0;
-    while (g.running && !g.bufferInitialized.load(std::memory_order_acquire)) {
+    while (g.running && !g.bufferInitialized.load(std::memory_order_acquire))
+    {
         Sleep(10);
         waitCount++;
-        if (waitCount > 500) {  // 5 second timeout
+        if (waitCount > 500)
+        { // 5 second timeout
             fprintf(stderr, "ERROR: Timeout waiting for first frame. Is the source monitor active?\n");
             fprintf(stderr, "       Try moving your mouse on the source monitor to trigger an update.\n");
             Cleanup();
             return 1;
         }
-        if (g.debug && waitCount % 100 == 0) {
+        if (g.debug && waitCount % 100 == 0)
+        {
             printf("[DEBUG] Still waiting for first frame... (%d ms)\n", waitCount * 10);
         }
     }
 
-    if (!g.running) {
+    if (!g.running)
+    {
         Cleanup();
         return 0;
     }
@@ -1550,47 +1990,63 @@ int main(int argc, char** argv) {
     MSG msg;
     bool noVSync = (g.userTargetFps == 0);
 
-    while (g.running) {
+    while (g.running)
+    {
         // Skip all frame pacing when running without VSync (--out 0)
-        if (!noVSync) {
+        if (!noVSync)
+        {
             // Wait for VSync timing signal (if waitable swap chain is available)
             // This ensures we acquire the freshest frame right after VSync
-            if (g.frameLatencyWaitable) {
+            if (g.frameLatencyWaitable)
+            {
                 WaitForSingleObjectEx(g.frameLatencyWaitable, 100, TRUE);
             }
 
             // Smart frame selection: only wait for next frame if desktop is active
             // This ensures consistent Skip:2-2 for 120Hz→60Hz while maintaining
             // 60 FPS output when desktop is idle (showing duplicate frames)
-            if (g.useSmartFrameSelection && g.targetFrameSkip > 1) {
+            if (g.useSmartFrameSelection && g.targetFrameSkip > 1)
+            {
                 UINT64 currentCapture = g.captureFrameId.load(std::memory_order_relaxed);
 
                 // Check if new frames are coming in (desktop is active)
-                if (currentCapture > g.lastCaptureCheckId) {
+                if (currentCapture > g.lastCaptureCheckId)
+                {
                     // Desktop is active - wait for the right frame
                     UINT64 targetId = g.lastRenderedId + g.targetFrameSkip;
 
                     // Only wait if we haven't reached target yet
-                    if (currentCapture < targetId) {
+                    if (currentCapture < targetId)
+                    {
                         // Use frame delay to wait for the next frame
-                        if (g.useFrameDelay && g.frameDelayUs > 0) {
+                        if (g.useFrameDelay && g.frameDelayUs > 0)
+                        {
                             DelayMicroseconds(g.frameDelayUs);
                         }
                     }
                 }
                 // Update check ID for next iteration
                 g.lastCaptureCheckId = currentCapture;
-            } else if (g.useFrameDelay && g.frameDelayUs > 0) {
+            }
+            else if (g.useFrameDelay && g.frameDelayUs > 0)
+            {
                 // Fallback: simple fixed delay
                 DelayMicroseconds(g.frameDelayUs);
             }
         }
 
-        while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { g.running = false; break; }
-            TranslateMessage(&msg); DispatchMessage(&msg);
+        while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT)
+            {
+                g.running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
-        if (!g.running) break;
+        if (!g.running)
+            break;
 
         // Wait for a new frame if we would otherwise show a duplicate
         // This significantly reduces dups when capture is faster than display
@@ -1598,26 +2054,30 @@ int main(int argc, char** argv) {
         // Strategy: Check every 1ms for a new frame. In the last 1ms before
         // we must render, check more aggressively (every 100µs).
         // Deadline = frame time minus 2ms headroom for render + present.
-        if (g.waitForNewFrame && g.bufferInitialized.load(std::memory_order_acquire)) {
+        if (g.waitForNewFrame && g.bufferInitialized.load(std::memory_order_acquire))
+        {
             LARGE_INTEGER waitStart, waitNow;
             QueryPerformanceCounter(&waitStart);
 
             // Calculate deadline: how long we can wait before we must render
             // Frame time minus headroom for rendering
             float frameTimeUs = 1000000.0f / g.targetRefreshRate;
-            float headroomUs = 2000.0f;  // 2ms headroom for render + present
+            float headroomUs = 2000.0f; // 2ms headroom for render + present
             float deadlineUs = frameTimeUs - headroomUs;
-            if (deadlineUs < 1000.0f) deadlineUs = 1000.0f;  // At least 1ms
+            if (deadlineUs < 1000.0f)
+                deadlineUs = 1000.0f; // At least 1ms
 
             LONGLONG deadlineTicks = (LONGLONG)(deadlineUs * freq.QuadPart / 1000000.0);
 
-            // Check if a new frame is available
+            // Check if a new frame is available (must be strictly greater than last rendered)
             UINT64 readyId = g.buffer.GetReadyFrameId();
-            while (readyId == g.lastRenderedId || readyId == 0) {
+            while (readyId <= g.lastRenderedId)
+            {
                 QueryPerformanceCounter(&waitNow);
                 LONGLONG elapsed = waitNow.QuadPart - waitStart.QuadPart;
 
-                if (elapsed >= deadlineTicks) {
+                if (elapsed >= deadlineTicks)
+                {
                     // Deadline reached - must render now
                     break;
                 }
@@ -1625,10 +2085,13 @@ int main(int argc, char** argv) {
                 // Calculate time remaining until deadline (in µs)
                 int remainingUs = (int)((deadlineTicks - elapsed) * 1000000 / freq.QuadPart);
 
-                if (remainingUs > 1000) {
+                if (remainingUs > 1000)
+                {
                     // More than 1ms until deadline - check every 1ms
                     DelayMicroseconds(1000);
-                } else {
+                }
+                else
+                {
                     // Last 1ms - check aggressively every 100µs
                     DelayMicroseconds(100);
                 }
@@ -1639,44 +2102,90 @@ int main(int argc, char** argv) {
         }
 
         Render();
-        // Present: sync interval 1 = VSync, 0 = no VSync (run as fast as possible)
-        g.swapChain->Present(g.userTargetFps == 0 ? 0 : 1, 0);
-
-        outCount++;
 
         // Use the actual acquired frame ID (set by Render), not the global capture counter
         UINT64 acquiredFrameId = g.lastAcquiredFrameId;
-        if (acquiredFrameId != g.lastRenderedId) {
+
+        // SAFETY CHECK: Detect if frame went backward (should NEVER happen)
+        bool skipPresent = false;
+        if (acquiredFrameId > 0 && g.lastRenderedId > 0 && acquiredFrameId < g.lastRenderedId)
+        {
+            g.frameWentBackward.fetch_add(1, std::memory_order_relaxed);
+            // Log detailed info for debugging
+            printf("\n[BUG] Frame went BACKWARD! acquired=%llu last=%llu buf=%d (w=%d r=%d d=%d)\n",
+                   (unsigned long long)acquiredFrameId,
+                   (unsigned long long)g.lastRenderedId,
+                   g.lastAcquiredBufIdx,
+                   g.buffer.writeIdx.load(std::memory_order_relaxed),
+                   g.buffer.readyIdx.load(std::memory_order_relaxed),
+                   g.buffer.displayIdx.load(std::memory_order_relaxed));
+            // Skip presenting this bad frame
+            skipPresent = true;
+            dupCount++;
+        }
+        else if (acquiredFrameId > g.lastRenderedId)
+        {
+            // Frame is newer - this is normal forward progress
             // Track frame skip for smart-select mode
-            if (g.useSmartFrameSelection && g.lastRenderedId > 0 && acquiredFrameId > g.lastRenderedId) {
+            if (g.useSmartFrameSelection && g.lastRenderedId > 0 && acquiredFrameId > g.lastRenderedId)
+            {
                 int skipDelta = (int)(acquiredFrameId - g.lastRenderedId);
-                if (skipDelta < g.frameSkipMin) g.frameSkipMin = skipDelta;
-                if (skipDelta > g.frameSkipMax) g.frameSkipMax = skipDelta;
+                if (skipDelta < g.frameSkipMin)
+                    g.frameSkipMin = skipDelta;
+                if (skipDelta > g.frameSkipMax)
+                    g.frameSkipMax = skipDelta;
                 g.frameSkipTotal += skipDelta;
                 g.frameSkipCount++;
             }
             uniqCount++;
             g.lastRenderedId = acquiredFrameId;
-        } else {
+        }
+        else
+        {
             dupCount++;
+        }
+
+        // Present: sync interval 1 = VSync, 0 = no VSync
+        // Skip present if we detected a backward frame (would show old content)
+        if (!skipPresent)
+        {
+            g.swapChain->Present(g.userTargetFps == 0 ? 0 : 1, 0);
+            outCount++;
         }
 
         QueryPerformanceCounter(&now);
         double statElapsed = (double)(now.QuadPart - lastStat.QuadPart) / freq.QuadPart;
-        if (statElapsed >= 1.0) {
+        if (statElapsed >= 1.0)
+        {
             int capCount = g.captureCount.exchange(0, std::memory_order_relaxed);
             int dwmDropped = g.droppedByDwm.exchange(0, std::memory_order_relaxed);
+            int backwardCount = g.frameWentBackward.exchange(0, std::memory_order_relaxed);
             int dropCount = capCount > uniqCount ? capCount - uniqCount : 0;
 
-            if (g.useSmartFrameSelection && g.frameSkipCount > 0) {
+            // Get timing stats (total microseconds spent in each section)
+            int acquireUs = g.capTimeAcquire.exchange(0, std::memory_order_relaxed);
+            int copyUs = g.capTimeCopy.exchange(0, std::memory_order_relaxed);
+            int releaseUs = g.capTimeRelease.exchange(0, std::memory_order_relaxed);
+            int loopCount = g.capLoopCount.exchange(0, std::memory_order_relaxed);
+
+            // Calculate average per-loop-iteration in microseconds
+            int loops = loopCount > 0 ? loopCount : 1;
+            int avgAcquire = acquireUs / loops;
+            int avgCopy = capCount > 0 ? copyUs / capCount : 0;
+            int avgRelease = releaseUs / loops;
+
+            if (g.useSmartFrameSelection && g.frameSkipCount > 0)
+            {
                 // Show frame skip stats for smart-select mode
                 float avgSkip = (float)g.frameSkipTotal / g.frameSkipCount;
-                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d DwmDrop:%3d Skip:%d-%d(%.1f)   ",
-                       outCount, capCount, uniqCount, dupCount, dropCount, dwmDropped,
+                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d DwmDrop:%3d Back:%d Skip:%d-%d(%.1f)   ",
+                       outCount, capCount, uniqCount, dupCount, dropCount, dwmDropped, backwardCount,
                        g.frameSkipMin == INT_MAX ? 0 : g.frameSkipMin, g.frameSkipMax, avgSkip);
-            } else {
-                printf("\rOut:%3d Cap:%3d Uniq:%3d Dup:%3d Drop:%3d DwmDrop:%3d   ",
-                       outCount, capCount, uniqCount, dupCount, dropCount, dwmDropped);
+            }
+            else
+            {
+                printf("\rOut:%3d Cap:%3d Dup:%3d DwmDrop:%3d Back:%3d [Acq:%dus Cpy:%dus Rel:%dus]   ",
+                       outCount, capCount, dupCount, dwmDropped, backwardCount, avgAcquire, avgCopy, avgRelease);
             }
             fflush(stdout);
 
